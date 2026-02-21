@@ -1,0 +1,28 @@
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Logs
+*.log
+logs/
+
+# PlatformIO / Python
+.firmware/.pio/
+**/.pio/
+**/.pytest_cache/
+**/__pycache__/
+*.pyc
+
+# Secrets (ALDRIG committa)
+**/secrets.h
+**/secrets.yaml
+**/.env
+**/*.key
+**/*.pem
+**/*.crt
+
+# Home Assistant (om du råkar dumpa config)
+home-assistant/**/secrets.yaml
+home-assistant/configuration.yaml
