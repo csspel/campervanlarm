@@ -1,9 +1,10 @@
 # =========================
-# Campervanlarm V2 - minimal HA package
+# Campervanlarm – HA package (ellie)
 # Topics:
-#  - Uplink:   van/ellie/tele/alive
-#  - Downlink: van/ellie/cmd/downlink   (retain=true)
-#  - Ack:      van/ellie/ack
+# - Uplink:   van/ellie/tele/alive, van/ellie/tele/gps, van/ellie/tele/pir
+# - Downlink: van/ellie/cmd/downlink (retain=true)
+# - Ack:      van/ellie/ack
+# - PIR ACK:  van/ellie/cmd/ack
 # =========================
 
 mqtt:
@@ -110,12 +111,12 @@ mqtt:
 # ---- UI helpers ----
 input_select:
   van_profile_desired:
-    name: "Van profil (önskad)"
+    name: "Van läge (önskat)"
     options:
       - PARKED
       - TRAVEL
-      - ALARM
-      - STOLEN
+      - ARMED
+      - TRIGGERED
     icon: mdi:van-utility
 
 input_number:
@@ -138,16 +139,13 @@ input_text:
     name: "Van senaste downlink skickat (HA-tid)"
     max: 32
 
-
 # ---- Derived sensors / status ----
 template:
   - sensor:
-      # HA-tid när senaste alive kom (inte payload timestamp)
       - name: "Van Alive senast (HA-tid)"
         unique_id: van_alive_last_ha_time
         device_class: timestamp
-        state: >
-          {{ states.sensor.van_alive_raw.last_updated }}
+        state: "{{ states.sensor.van_alive_raw.last_updated }}"
 
       - name: "Minuter sedan Van Alive"
         unique_id: van_minutes_since_alive
@@ -161,18 +159,15 @@ template:
             9999
           {% endif %}
 
-      - name: "Van profil (nuvarande)"
+      - name: "Van läge (nuvarande)"
         unique_id: van_profile_current
-        state: >
-          {{ states('sensor.van_profile_device') }}
+        state: "{{ states('sensor.van_profile_device') }}"
 
-  - binary_sensor:
+    binary_sensor:
       - name: "Van väntar på ACK"
         unique_id: van_waiting_for_ack
-        state: >
-          {{ (states('input_number.van_last_sent_ack_id') | int(0)) > 0 }}
+        state: "{{ (states('input_number.van_last_sent_ack_id') | int(0)) > 0 }}"
 
-      # Online om senaste alive kom inom 5 minuter
       - name: "Van online"
         unique_id: van_online
         state: >
@@ -183,13 +178,12 @@ template:
             false
           {% endif %}
 
-
 automation:
   # -------------------------
-  # 1) När du ändrar profil i UI -> skicka retained downlink
+  # 1) När du ändrar läge i UI -> skicka retained downlink
   # -------------------------
   - id: van_send_profile_downlink
-    alias: "Van: Skicka profil (downlink retained)"
+    alias: "Van: Skicka läge (downlink retained)"
     mode: single
     trigger:
       - platform: state
@@ -198,21 +192,18 @@ automation:
       new_profile: "{{ trigger.to_state.state }}"
       next_id: "{{ (states('input_number.van_downlink_msg_id') | int(0)) + 1 }}"
     action:
-      # bump counter
       - service: input_number.set_value
         target:
           entity_id: input_number.van_downlink_msg_id
         data:
           value: "{{ next_id }}"
 
-      # store "pending ack id"
       - service: input_number.set_value
         target:
           entity_id: input_number.van_last_sent_ack_id
         data:
           value: "{{ next_id }}"
 
-      # publish retained downlink
       - service: mqtt.publish
         data:
           topic: "van/ellie/cmd/downlink"
@@ -226,17 +217,15 @@ automation:
               "commands": []
             }
 
-      # store HA-time when sent (overview)
       - service: input_text.set_value
         target:
           entity_id: input_text.van_last_downlink_sent
         data:
           value: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
 
-
   # -------------------------
   # 2) När ACK kommer -> om ack_msg_id matchar senaste skickade, rensa retained cmd/downlink (Alternativ A)
-  #    + uppdatera UI direkt från ACK
+  # + uppdatera UI direkt från ACK
   # -------------------------
   - id: van_clear_downlink_on_ack
     alias: "Van: Rensa downlink efter ACK"
@@ -254,7 +243,6 @@ automation:
       - condition: template
         value_template: "{{ ack_id == expected_id and status == 'OK' }}"
     action:
-      # Clear retained message by publishing empty payload retained
       - service: mqtt.publish
         data:
           topic: "van/ellie/cmd/downlink"
@@ -262,11 +250,10 @@ automation:
           qos: 1
           payload: ""
 
-      # Update UI to what device confirms (optional but nice)
       - choose:
           - conditions:
               - condition: template
-                value_template: "{{ applied_profile in ['PARKED','TRAVEL','ALARM','STOLEN'] }}"
+                value_template: "{{ applied_profile in ['PARKED','TRAVEL','ARMED','TRIGGERED'] }}"
             sequence:
               - service: input_select.select_option
                 target:
@@ -274,28 +261,24 @@ automation:
                 data:
                   option: "{{ applied_profile }}"
 
-      # mark "no pending"
       - service: input_number.set_value
         target:
           entity_id: input_number.van_last_sent_ack_id
         data:
           value: 0
 
-
   # -------------------------
-  # 3) Synka UI-profil från device vid HA-omstart / när device rapporterar,
-  #    men bara om vi INTE har ett pending-kommando (förhindrar "studs")
+  # 3) Synka UI-läge från device (bara om inget pending)
   # -------------------------
   - id: van_sync_ui_profile_from_device
-    alias: "Van: Synka UI-profil från device (bara om inget pending)"
+    alias: "Van: Synka UI-läge från device (bara om inget pending)"
     mode: single
     trigger:
       - platform: state
         entity_id: sensor.van_profile_device
     condition:
       - condition: template
-        value_template: >
-          {{ trigger.to_state.state in ['PARKED','TRAVEL','ALARM','STOLEN'] }}
+        value_template: "{{ trigger.to_state.state in ['PARKED','TRAVEL','ARMED','TRIGGERED'] }}"
       - condition: state
         entity_id: binary_sensor.van_vantar_pa_ack
         state: "off"
@@ -305,7 +288,6 @@ automation:
           entity_id: input_select.van_profile_desired
         data:
           option: "{{ trigger.to_state.state }}"
-
 
   # -------------------------
   # 4) PIR-ACK: när PIR-event kommer, skicka ack tillbaka så enheten kan rensa pending
@@ -330,7 +312,4 @@ automation:
           qos: 0
           retain: false
           payload: >
-            {
-              "type": "PIR_ACK",
-              "pir_event_id": {{ eid }}
-            }
+            { "type": "PIR_ACK", "pir_event_id": {{ eid }} }
