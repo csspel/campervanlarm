@@ -1,1 +1,336 @@
+# =========================
+# Campervanlarm V2 - minimal HA package
+# Topics:
+#  - Uplink:   van/ellie/tele/alive
+#  - Downlink: van/ellie/cmd/downlink   (retain=true)
+#  - Ack:      van/ellie/ack
+# =========================
 
+mqtt:
+  sensor:
+    - name: "Van Alive (raw)"
+      unique_id: van_alive_raw
+      state_topic: "van/ellie/tele/alive"
+      value_template: "{{ value }}"
+      force_update: true
+
+    - name: "Van Profile (device)"
+      unique_id: van_profile_device
+      state_topic: "van/ellie/tele/alive"
+      value_template: "{{ value_json.profile | default('unknown') }}"
+      force_update: true
+
+    - name: "Van Uptime (s)"
+      unique_id: van_uptime_s
+      state_topic: "van/ellie/tele/alive"
+      unit_of_measurement: "s"
+      state_class: measurement
+      value_template: "{{ value_json.uptime_s | default(0) }}"
+      force_update: true
+
+    - name: "Van Msg ID"
+      unique_id: van_msg_id
+      state_topic: "van/ellie/tele/alive"
+      value_template: "{{ value_json.msg_id | default('') }}"
+      force_update: true
+
+    - name: "Van Ack (raw)"
+      unique_id: van_ack_raw
+      state_topic: "van/ellie/ack"
+      value_template: "{{ value }}"
+      force_update: true
+
+    - name: "Van Ack Msg ID"
+      unique_id: van_ack_msg_id
+      state_topic: "van/ellie/ack"
+      value_template: "{{ value_json.ack_msg_id | default(0) }}"
+      force_update: true
+
+    - name: "Van Ack Status"
+      unique_id: van_ack_status
+      state_topic: "van/ellie/ack"
+      value_template: "{{ value_json.status | default('') }}"
+      force_update: true
+
+    - name: "Van Ack Detail"
+      unique_id: van_ack_detail
+      state_topic: "van/ellie/ack"
+      value_template: "{{ value_json.detail | default('') }}"
+      force_update: true
+
+    - name: "Van PIR (raw)"
+      unique_id: van_pir_raw
+      state_topic: "van/ellie/tele/pir"
+      value_template: "{{ value }}"
+      force_update: true
+
+    - name: "Van PIR Event ID"
+      unique_id: van_pir_event_id
+      state_topic: "van/ellie/tele/pir"
+      value_template: "{{ value_json.pir_event_id | default(0) }}"
+      force_update: true
+
+    - name: "Van PIR Count"
+      unique_id: van_pir_count
+      state_topic: "van/ellie/tele/pir"
+      value_template: "{{ value_json.count | default(0) }}"
+      force_update: true
+
+  device_tracker:
+    - name: "Van Ellie"
+      unique_id: van_ellie_tracker
+      state_topic: "van/ellie/tele/gps"
+      value_template: "home"
+      json_attributes_topic: "van/ellie/tele/gps"
+      json_attributes_template: >
+        {% set p = value_json %}
+        {% if p.type != 'GPS' %}
+          {}
+        {% elif p.mode == 'single' %}
+          {
+            "latitude": {{ p.lat }},
+            "longitude": {{ p.lon }},
+            "speed_kmh": {{ p.speed_kmh | default(0) }},
+            "epoch_utc": {{ p.epoch_utc | default(0) }},
+            "profile": "{{ p.profile | default('') }}"
+          }
+        {% elif p.mode == 'batch' and p.fixes is defined and (p.fixes | length) > 0 %}
+          {% set fx = p.fixes[-1] %}
+          {
+            "latitude": {{ fx[0] }},
+            "longitude": {{ fx[1] }},
+            "speed_kmh": {{ fx[4] | default(0) }},
+            "epoch_utc": {{ (p.t0 | default(0)) + (p.dt | default(0)) * ((p.fixes | length) - 1) }},
+            "profile": "{{ p.profile | default('') }}"
+          }
+        {% else %}
+          {}
+        {% endif %}
+
+# ---- UI helpers ----
+input_select:
+  van_profile_desired:
+    name: "Van profil (önskad)"
+    options:
+      - PARKED
+      - TRAVEL
+      - ALARM
+      - STOLEN
+    icon: mdi:van-utility
+
+input_number:
+  van_downlink_msg_id:
+    name: "Van downlink ack_msg_id (räknare)"
+    min: 1
+    max: 9999999
+    step: 1
+    mode: box
+
+  van_last_sent_ack_id:
+    name: "Van senaste skickade ack_msg_id"
+    min: 0
+    max: 9999999
+    step: 1
+    mode: box
+
+input_text:
+  van_last_downlink_sent:
+    name: "Van senaste downlink skickat (HA-tid)"
+    max: 32
+
+
+# ---- Derived sensors / status ----
+template:
+  - sensor:
+      # HA-tid när senaste alive kom (inte payload timestamp)
+      - name: "Van Alive senast (HA-tid)"
+        unique_id: van_alive_last_ha_time
+        device_class: timestamp
+        state: >
+          {{ states.sensor.van_alive_raw.last_updated }}
+
+      - name: "Minuter sedan Van Alive"
+        unique_id: van_minutes_since_alive
+        unit_of_measurement: "min"
+        state_class: measurement
+        state: >
+          {% set ts = as_timestamp(states.sensor.van_alive_raw.last_updated) %}
+          {% if ts is number %}
+            {{ ((now().timestamp() - ts) / 60) | round(1) }}
+          {% else %}
+            9999
+          {% endif %}
+
+      - name: "Van profil (nuvarande)"
+        unique_id: van_profile_current
+        state: >
+          {{ states('sensor.van_profile_device') }}
+
+  - binary_sensor:
+      - name: "Van väntar på ACK"
+        unique_id: van_waiting_for_ack
+        state: >
+          {{ (states('input_number.van_last_sent_ack_id') | int(0)) > 0 }}
+
+      # Online om senaste alive kom inom 5 minuter
+      - name: "Van online"
+        unique_id: van_online
+        state: >
+          {% set ts = as_timestamp(states.sensor.van_alive_raw.last_updated) %}
+          {% if ts is number %}
+            {{ (now().timestamp() - ts) < 300 }}
+          {% else %}
+            false
+          {% endif %}
+
+
+automation:
+  # -------------------------
+  # 1) När du ändrar profil i UI -> skicka retained downlink
+  # -------------------------
+  - id: van_send_profile_downlink
+    alias: "Van: Skicka profil (downlink retained)"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_select.van_profile_desired
+    variables:
+      new_profile: "{{ trigger.to_state.state }}"
+      next_id: "{{ (states('input_number.van_downlink_msg_id') | int(0)) + 1 }}"
+    action:
+      # bump counter
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.van_downlink_msg_id
+        data:
+          value: "{{ next_id }}"
+
+      # store "pending ack id"
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.van_last_sent_ack_id
+        data:
+          value: "{{ next_id }}"
+
+      # publish retained downlink
+      - service: mqtt.publish
+        data:
+          topic: "van/ellie/cmd/downlink"
+          retain: true
+          qos: 1
+          payload: >
+            {
+              "ack_msg_id": {{ next_id }},
+              "desired_profile": "{{ new_profile }}",
+              "config": {},
+              "commands": []
+            }
+
+      # store HA-time when sent (overview)
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.van_last_downlink_sent
+        data:
+          value: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+
+
+  # -------------------------
+  # 2) När ACK kommer -> om ack_msg_id matchar senaste skickade, rensa retained cmd/downlink (Alternativ A)
+  #    + uppdatera UI direkt från ACK
+  # -------------------------
+  - id: van_clear_downlink_on_ack
+    alias: "Van: Rensa downlink efter ACK"
+    mode: single
+    trigger:
+      - platform: mqtt
+        topic: "van/ellie/ack"
+    variables:
+      js: "{{ trigger.payload_json }}"
+      ack_id: "{{ js.ack_msg_id | int(0) }}"
+      expected_id: "{{ states('input_number.van_last_sent_ack_id') | int(0) }}"
+      status: "{{ js.status | default('') }}"
+      applied_profile: "{{ js.profile | default('') }}"
+    condition:
+      - condition: template
+        value_template: "{{ ack_id == expected_id and status == 'OK' }}"
+    action:
+      # Clear retained message by publishing empty payload retained
+      - service: mqtt.publish
+        data:
+          topic: "van/ellie/cmd/downlink"
+          retain: true
+          qos: 1
+          payload: ""
+
+      # Update UI to what device confirms (optional but nice)
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: "{{ applied_profile in ['PARKED','TRAVEL','ALARM','STOLEN'] }}"
+            sequence:
+              - service: input_select.select_option
+                target:
+                  entity_id: input_select.van_profile_desired
+                data:
+                  option: "{{ applied_profile }}"
+
+      # mark "no pending"
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.van_last_sent_ack_id
+        data:
+          value: 0
+
+
+  # -------------------------
+  # 3) Synka UI-profil från device vid HA-omstart / när device rapporterar,
+  #    men bara om vi INTE har ett pending-kommando (förhindrar "studs")
+  # -------------------------
+  - id: van_sync_ui_profile_from_device
+    alias: "Van: Synka UI-profil från device (bara om inget pending)"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: sensor.van_profile_device
+    condition:
+      - condition: template
+        value_template: >
+          {{ trigger.to_state.state in ['PARKED','TRAVEL','ALARM','STOLEN'] }}
+      - condition: state
+        entity_id: binary_sensor.van_vantar_pa_ack
+        state: "off"
+    action:
+      - service: input_select.select_option
+        target:
+          entity_id: input_select.van_profile_desired
+        data:
+          option: "{{ trigger.to_state.state }}"
+
+
+  # -------------------------
+  # 4) PIR-ACK: när PIR-event kommer, skicka ack tillbaka så enheten kan rensa pending
+  # -------------------------
+  - id: van_pir_auto_ack
+    alias: "Van: Auto-ACK PIR-event"
+    mode: queued
+    max: 20
+    trigger:
+      - platform: mqtt
+        topic: "van/ellie/tele/pir"
+    variables:
+      js: "{{ trigger.payload_json }}"
+      eid: "{{ js.pir_event_id | int(0) }}"
+    condition:
+      - condition: template
+        value_template: "{{ eid > 0 }}"
+    action:
+      - service: mqtt.publish
+        data:
+          topic: "van/ellie/cmd/ack"
+          qos: 0
+          retain: false
+          payload: >
+            {
+              "type": "PIR_ACK",
+              "pir_event_id": {{ eid }}
+            }
