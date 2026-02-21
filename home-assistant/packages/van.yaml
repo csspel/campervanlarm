@@ -81,29 +81,74 @@ mqtt:
     - name: "Van Ellie"
       unique_id: van_ellie_tracker
       state_topic: "van/ellie/tele/gps"
-      value_template: "home"
+
+      # Uppdatera endast "state" när vi har en giltig position
+      value_template: >
+        {% set p = value_json %}
+        {% if p.type != 'GPS' %}
+          ""
+        {% elif p.mode == 'single' %}
+          {% if (p.fix_ok | default(false)) and (p.lat is defined) and (p.lon is defined) and (p.lat is not none) and (p.lon is not none) %}
+            "home"
+          {% else %}
+            ""
+          {% endif %}
+        {% elif p.mode == 'batch' and p.fixes is defined and (p.fixes | length) > 0 %}
+          {% set fx = p.fixes[-1] %}
+          {% if (fx[0] is defined) and (fx[1] is defined) and (fx[0] is not none) and (fx[1] is not none) %}
+            "home"
+          {% else %}
+            ""
+          {% endif %}
+        {% else %}
+          ""
+        {% endif %}
+
       json_attributes_topic: "van/ellie/tele/gps"
       json_attributes_template: >
         {% set p = value_json %}
         {% if p.type != 'GPS' %}
           {}
         {% elif p.mode == 'single' %}
-          {
-            "latitude": {{ p.lat }},
-            "longitude": {{ p.lon }},
-            "speed_kmh": {{ p.speed_kmh | default(0) }},
-            "epoch_utc": {{ p.epoch_utc | default(0) }},
-            "profile": "{{ p.profile | default('') }}"
-          }
+          {% set fix = p.fix_ok | default(false) %}
+          {% set has_lat = p.lat is defined and p.lat is not none %}
+          {% set has_lon = p.lon is defined and p.lon is not none %}
+          {% if fix and has_lat and has_lon %}
+            {
+              "latitude": {{ p.lat }},
+              "longitude": {{ p.lon }},
+              "speed_kmh": {{ p.speed_kmh | default(0) }},
+              "epoch_utc": {{ p.epoch_utc | default(0) }},
+              "profile": "{{ p.profile | default('') }}",
+              "fix_ok": true
+            }
+          {% else %}
+            {
+              "epoch_utc": {{ p.epoch_utc | default(0) }},
+              "profile": "{{ p.profile | default('') }}",
+              "fix_ok": false
+            }
+          {% endif %}
         {% elif p.mode == 'batch' and p.fixes is defined and (p.fixes | length) > 0 %}
           {% set fx = p.fixes[-1] %}
-          {
-            "latitude": {{ fx[0] }},
-            "longitude": {{ fx[1] }},
-            "speed_kmh": {{ fx[4] | default(0) }},
-            "epoch_utc": {{ (p.t0 | default(0)) + (p.dt | default(0)) * ((p.fixes | length) - 1) }},
-            "profile": "{{ p.profile | default('') }}"
-          }
+          {% set has_lat = fx[0] is defined and fx[0] is not none %}
+          {% set has_lon = fx[1] is defined and fx[1] is not none %}
+          {% if has_lat and has_lon %}
+            {
+              "latitude": {{ fx[0] }},
+              "longitude": {{ fx[1] }},
+              "speed_kmh": {{ fx[4] | default(0) }},
+              "epoch_utc": {{ (p.t0 | default(0)) + (p.dt | default(0)) * ((p.fixes | length) - 1) }},
+              "profile": "{{ p.profile | default('') }}",
+              "fix_ok": true
+            }
+          {% else %}
+            {
+              "epoch_utc": {{ (p.t0 | default(0)) + (p.dt | default(0)) * ((p.fixes | length) - 1) }},
+              "profile": "{{ p.profile | default('') }}",
+              "fix_ok": false
+            }
+          {% endif %}
         {% else %}
           {}
         {% endif %}
