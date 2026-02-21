@@ -1,1 +1,1 @@
-
+Kod för Home assistant för att kunna kommunicera med T-SIM7080G som blir en larmsensor (PIR, GPS och status), det är Home Assistant som hämtar upp MQTT-meddelande som T-SIM7080G skickar och bevakar och bearbetar information och visualiserar den för användaren. Det är också i HA som man sätter profil.
