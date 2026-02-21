@@ -1,14 +1,21 @@
 # =========================
 # Campervanlarm – HA package (ellie)
-# Topics:
-# - Uplink:   van/ellie/tele/alive, van/ellie/tele/gps, van/ellie/tele/pir
-# - Downlink: van/ellie/cmd/downlink (retain=true)
-# - Ack:      van/ellie/ack
-# - PIR ACK:  van/ellie/cmd/ack
+# Topic base: van/ellie/
+# Uplink:
+#   - van/ellie/tele/alive
+#   - van/ellie/tele/gps    (mode: single|batch)
+#   - van/ellie/tele/pir
+# Downlink:
+#   - van/ellie/cmd/downlink (retain=true, qos=1)
+# Ack:
+#   - van/ellie/ack          (device -> HA)
+# Event ACK:
+#   - van/ellie/cmd/ack      (HA -> device)
 # =========================
 
 mqtt:
   sensor:
+    # ---------- RAW / BASIC ----------
     - name: "Van Alive (raw)"
       unique_id: van_alive_raw
       state_topic: "van/ellie/tele/alive"
@@ -35,6 +42,7 @@ mqtt:
       value_template: "{{ value_json.msg_id | default('') }}"
       force_update: true
 
+    # ---------- ACK ----------
     - name: "Van Ack (raw)"
       unique_id: van_ack_raw
       state_topic: "van/ellie/ack"
@@ -59,6 +67,7 @@ mqtt:
       value_template: "{{ value_json.detail | default('') }}"
       force_update: true
 
+    # ---------- PIR ----------
     - name: "Van PIR (raw)"
       unique_id: van_pir_raw
       state_topic: "van/ellie/tele/pir"
@@ -77,12 +86,71 @@ mqtt:
       value_template: "{{ value_json.count | default(0) }}"
       force_update: true
 
+    # ---------- GPS META ----------
+    # fix_ok från senaste GPS-meddelandet (single: använder p.fix_ok, batch: true om sista fix har lat/lon)
+    - name: "Van GPS fix_ok"
+      unique_id: van_gps_fix_ok
+      state_topic: "van/ellie/tele/gps"
+      value_template: >
+        {% set p = value_json %}
+        {% if p.type == 'GPS' and p.mode == 'single' %}
+          {{ p.fix_ok | default(false) }}
+        {% elif p.type == 'GPS' and p.mode == 'batch' and p.fixes is defined and (p.fixes | length) > 0 %}
+          {% set fx = p.fixes[-1] %}
+          {{ (fx[0] is defined) and (fx[1] is defined) and (fx[0] is not none) and (fx[1] is not none) }}
+        {% else %}
+          {{ states('sensor.van_gps_fix_ok') | default('false') }}
+        {% endif %}
+      force_update: true
+
+    # epoch_utc från senaste GPS (single eller batch)
+    - name: "Van GPS epoch_utc"
+      unique_id: van_gps_epoch_utc
+      state_topic: "van/ellie/tele/gps"
+      value_template: >
+        {% set p = value_json %}
+        {% if p.type == 'GPS' and p.mode == 'single' %}
+          {{ p.epoch_utc | default(0) }}
+        {% elif p.type == 'GPS' and p.mode == 'batch' and p.fixes is defined and (p.fixes | length) > 0 %}
+          {{ (p.t0 | default(0)) + (p.dt | default(0)) * ((p.fixes | length) - 1) }}
+        {% else %}
+          {{ states('sensor.van_gps_epoch_utc') | int(0) }}
+        {% endif %}
+      force_update: true
+
+    # Sätter epoch_utc endast när vi har fix_ok + lat/lon (single) eller giltig sista punkt (batch)
+    - name: "Van GPS FIX senaste epoch_utc"
+      unique_id: van_gps_fix_last_epoch
+      state_topic: "van/ellie/tele/gps"
+      value_template: >
+        {% set p = value_json %}
+        {% if p.type != 'GPS' %}
+          {{ states('sensor.van_gps_fix_senaste_epoch_utc') | int(0) }}
+        {% elif p.mode == 'single' %}
+          {% if (p.fix_ok | default(false)) and (p.lat is defined) and (p.lon is defined) and (p.lat is not none) and (p.lon is not none) %}
+            {{ p.epoch_utc | default(0) }}
+          {% else %}
+            {{ states('sensor.van_gps_fix_senaste_epoch_utc') | int(0) }}
+          {% endif %}
+        {% elif p.mode == 'batch' and p.fixes is defined and (p.fixes | length) > 0 %}
+          {% set fx = p.fixes[-1] %}
+          {% if (fx[0] is defined) and (fx[1] is defined) and (fx[0] is not none) and (fx[1] is not none) %}
+            {{ (p.t0 | default(0)) + (p.dt | default(0)) * ((p.fixes | length) - 1) }}
+          {% else %}
+            {{ states('sensor.van_gps_fix_senaste_epoch_utc') | int(0) }}
+          {% endif %}
+        {% else %}
+          {{ states('sensor.van_gps_fix_senaste_epoch_utc') | int(0) }}
+        {% endif %}
+      force_update: true
+
   device_tracker:
     - name: "Van Ellie"
       unique_id: van_ellie_tracker
       state_topic: "van/ellie/tele/gps"
 
-      # Uppdatera endast "state" när vi har en giltig position
+      # Uppdatera endast tracker-state när vi har en giltig position (fix ok + lat/lon).
+      # När tom sträng returneras så "studsar" inte kartan på fix-lösa uppdateringar.
       value_template: >
         {% set p = value_json %}
         {% if p.type != 'GPS' %}
@@ -208,6 +276,25 @@ template:
         unique_id: van_profile_current
         state: "{{ states('sensor.van_profile_device') }}"
 
+      # GPS fix: senaste tidpunkt (HA-tid) + minuter sedan fix
+      - name: "Van GPS fix senast (HA-tid)"
+        unique_id: van_gps_fix_last_time
+        device_class: timestamp
+        state: >
+          {{ states.sensor.van_gps_fix_senaste_epoch_utc.last_updated }}
+
+      - name: "Minuter sedan Van GPS fix"
+        unique_id: van_minutes_since_gps_fix
+        unit_of_measurement: "min"
+        state_class: measurement
+        state: >
+          {% set ts = as_timestamp(states.sensor.van_gps_fix_senaste_epoch_utc.last_updated) %}
+          {% if ts is number and (states('sensor.van_gps_fix_senaste_epoch_utc') | int(0)) > 0 %}
+            {{ ((now().timestamp() - ts) / 60) | round(1) }}
+          {% else %}
+            9999
+          {% endif %}
+
     binary_sensor:
       - name: "Van väntar på ACK"
         unique_id: van_waiting_for_ack
@@ -219,6 +306,16 @@ template:
           {% set ts = as_timestamp(states.sensor.van_alive_raw.last_updated) %}
           {% if ts is number %}
             {{ (now().timestamp() - ts) < 300 }}
+          {% else %}
+            false
+          {% endif %}
+
+      - name: "Van GPS fix nyligen"
+        unique_id: van_gps_fix_recent
+        state: >
+          {% set ts = as_timestamp(states.sensor.van_gps_fix_senaste_epoch_utc.last_updated) %}
+          {% if ts is number and (states('sensor.van_gps_fix_senaste_epoch_utc') | int(0)) > 0 %}
+            {{ (now().timestamp() - ts) < 600 }}
           {% else %}
             false
           {% endif %}
@@ -269,7 +366,7 @@ automation:
           value: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
 
   # -------------------------
-  # 2) När ACK kommer -> om ack_msg_id matchar senaste skickade, rensa retained cmd/downlink (Alternativ A)
+  # 2) När ACK kommer -> om ack_msg_id matchar senaste skickade, rensa retained cmd/downlink
   # + uppdatera UI direkt från ACK
   # -------------------------
   - id: van_clear_downlink_on_ack
