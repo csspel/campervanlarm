@@ -1,36 +1,47 @@
 // profiles.cpp
 #include "profiles.h"
 
-// En enda källa för alla intervall.
-// Justera här – så följer main.cpp automatiskt med.
+// Intervall enligt krav/spec:
+// PARKED: alive 5 min + single GPS vid varje alive (GNSS “on” hanteras i pipeline sen)
+// TRAVEL: batch 5 min (30x10s) + alive 5 min -> gpsInterval=10s, commInterval=5min
+// TRIGGERED: single 15s + alive 15s
+// ARMED: alive 30 min (sleep), PIR endast här
 static ProfileConfig profileTable[] = {
-    // TRAVEL: GPS ofta (men uplink avgör hur ofta du faktiskt skickar), PIR normalt AV i travel
-    {ProfileId::TRAVEL, "TRAVEL",
-     10 * 1000UL,     // gpsIntervalMs (används inte fullt ut i pipeline just nu)
-     5 * 60 * 1000UL, // commIntervalMs (styr i praktiken när GPS tas/skickas)
-     30 * 1000UL,     // gpsFixWaitMs  (MÅSTE vara >0 annars blir det ingen GPS)
-     false, false},   // pirFront, pirBack
+    // PARKED (disarmed)
+    {
+        ProfileId::PARKED, "PARKED",
+        5 * 60 * 1000UL, // gpsIntervalMs (single vid alive-cykel)
+        5 * 60 * 1000UL, // commIntervalMs
+        60 * 1000UL,     // gpsFixWaitMs (per cykel, kan justeras senare)
+        false, false     // PIR OFF
+    },
 
-    // PARKED: GPS var 5 min, PIR på (om du vill övervaka i parked)
-    {ProfileId::PARKED, "PARKED",
-     5 * 60 * 1000UL,
-     5 * 60 * 1000UL,
-     60 * 1000UL,
-     true, true},
+    // TRAVEL (disarmed)
+    {
+        ProfileId::TRAVEL, "TRAVEL",
+        10 * 1000UL,     // gpsIntervalMs (sample för batch, dt=10s)
+        5 * 60 * 1000UL, // commIntervalMs (batch + alive var 5 min)
+        30 * 1000UL,     // gpsFixWaitMs
+        false, false     // PIR OFF
+    },
 
-    // ALARM: GPS som backup + PIR på
-    {ProfileId::ALARM, "ALARM",
-     5 * 60 * 1000UL,
-     5 * 60 * 1000UL,
-     60 * 1000UL,
-     true, true},
+    // ARMED (sensorer aktiva)
+    {
+        ProfileId::ARMED, "ARMED",
+        30 * 60 * 1000UL, // gpsIntervalMs (om du ens tar GPS här - kan vara samma som comm)
+        30 * 60 * 1000UL, // commIntervalMs (alive var 30 min)
+        60 * 1000UL,      // gpsFixWaitMs
+        true, true        // PIR ON
+    },
 
-    // STOLEN: tätare spårning, PIR kan vara vad du vill (jag sätter av här)
-    {ProfileId::STOLEN, "STOLEN",
-     2 * 60 * 1000UL,
-     2 * 60 * 1000UL,
-     60 * 1000UL,
-     false, false},
+    // TRIGGERED (utlöst larm)
+    {
+        ProfileId::TRIGGERED, "TRIGGERED",
+        15 * 1000UL, // gpsIntervalMs (single var 15s)
+        15 * 1000UL, // commIntervalMs (alive var 15s)
+        15 * 1000UL, // gpsFixWaitMs
+        false, false // PIR OFF (PIR är bara i ARMED)
+    },
 };
 
 static ProfileId currentId = ProfileId::PARKED;
@@ -58,7 +69,6 @@ const ProfileConfig &currentProfile()
 void setProfile(ProfileId id)
 {
   currentId = id;
-  extern void pipelineOnProfileChanged(ProfileId newProfile);
   pipelineOnProfileChanged(id);
 }
 
@@ -72,25 +82,26 @@ bool profileFromString(const String &s, ProfileId &out)
   String up = s;
   up.toUpperCase();
 
-  if (up == "TRAVEL")
-  {
-    out = ProfileId::TRAVEL;
-    return true;
-  }
   if (up == "PARKED")
   {
     out = ProfileId::PARKED;
     return true;
   }
-  if (up == "ALARM")
+  if (up == "TRAVEL")
   {
-    out = ProfileId::ALARM;
+    out = ProfileId::TRAVEL;
     return true;
   }
-  if (up == "STOLEN")
+  if (up == "ARMED")
   {
-    out = ProfileId::STOLEN;
+    out = ProfileId::ARMED;
     return true;
   }
+  if (up == "TRIGGERED")
+  {
+    out = ProfileId::TRIGGERED;
+    return true;
+  }
+
   return false;
 }

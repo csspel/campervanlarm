@@ -55,14 +55,14 @@ static const char MQTT_TOPIC_PIR[] = "van/ellie/tele/pir";
 static const char MQTT_TOPIC_DOWNLINK[] = "van/ellie/cmd/downlink";
 
 // Downlink: PIR ACK (bör vara retain=false från server-sidan)
-static const char MQTT_TOPIC_CMD_ACK[] = "van/ellie/cmd/pir_ack";
+static const char MQTT_TOPIC_CMD_ACK[] = "van/ellie/cmd/ack";
 
 static const char MQTT_TOPIC_ACK[] = "van/ellie/ack";
 static const char MQTT_TOPIC_VERSION[] = "van/ellie/tele/version";
 
 constexpr uint32_t MQTT_ONLINE_WINDOW_MS = 30000UL; // 30 s
 
-static const char DEVICE_ID[] = "van_ellie";
+static const char DEVICE_ID[] = "ellie";
 
 // ============================================================
 // Timers

@@ -1,4 +1,4 @@
-// logging.cpp - RAM + Serial logging (SD disabled)
+// logging.cpp - RAM + Serial logging
 //
 // Goal:
 // - No SD_MMC usage at all (it caused instability / errors)
@@ -44,7 +44,7 @@ static void ringPush(const String &line)
 void loggingInit()
 {
   // Nothing to init besides a banner.
-  Serial.println("LOG: RAM-only logging (SD disabled)");
+  Serial.println("LOG: RAM-only logging");
 }
 
 void logSystem(const String &msg)
@@ -52,15 +52,4 @@ void logSystem(const String &msg)
   String line = makePrefix() + msg;
   Serial.println(line);
   ringPush(line);
-}
-
-// Kept for compatibility. With SD disabled, "flush" is a no-op.
-void loggingFlush(uint32_t /*budgetMs*/, uint16_t /*maxLines*/)
-{
-  // no-op
-}
-
-void loggingFlushIdle()
-{
-  // no-op
 }

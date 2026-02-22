@@ -25,7 +25,7 @@ static PirOutbox g_pir;
 static volatile uint16_t g_pirIsrCount = 0;
 static volatile uint8_t g_pirIsrMask = 0; // bit0=front, bit1=back
 static uint32_t g_nextEventId = 1;        // TODO: persist i NVS senare
-static bool g_alarmGpsSkipUsed = false;   // skip GPS EN gång per ALARM-episod
+static bool g_alarmGpsSkipUsed = false;   // skip GPS EN gång per ARMED-episod
 
 static void IRAM_ATTR isrPirFront()
 {
@@ -254,9 +254,9 @@ void pipelineTick(uint32_t nowMs)
 
         if (g_needComm)
         {
-            if (p.id == ProfileId::ALARM)
+            if (p.id == ProfileId::ARMED)
             {
-                // Skip GPS exakt en gång per ALARM-episod (när PIR pending första gången)
+                // Skip GPS exakt en gång per ARMED-episod (när PIR pending första gången)
                 if (g_pir.pending && !g_alarmGpsSkipUsed)
                 {
                     g_gpsPlan = GpsPlan::NONE;
@@ -291,7 +291,7 @@ void pipelineTick(uint32_t nowMs)
         if (!g_needComm)
         {
             // Vänta enligt profil
-            if (p.id == ProfileId::ALARM)
+            if (p.id == ProfileId::ARMED)
                 stepEnter(Step::STEP_ALARM_WAIT, nowMs);
             else
                 stepEnter(Step::STEP_PARKED_WAIT, nowMs);
@@ -451,7 +451,7 @@ void pipelineTick(uint32_t nowMs)
         g_nextCommAtMs = nowMs + p.commIntervalMs;
 
         // Gå till WAIT enligt profil
-        if (p.id == ProfileId::ALARM)
+        if (p.id == ProfileId::ARMED)
             stepEnter(Step::STEP_ALARM_WAIT, nowMs);
         else
             stepEnter(Step::STEP_PARKED_WAIT, nowMs);

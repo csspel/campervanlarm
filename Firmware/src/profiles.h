@@ -29,7 +29,6 @@ void setProfile(ProfileId id);
 const char *profileName(ProfileId id);
 
 // Parse från MQTT desired_profile.
-// Stöder även gamla namn för bakåtkomp: ALARM->ARMED, STOLEN->TRIGGERED.
 bool profileFromString(const String &s, ProfileId &out);
 
 // Hook som pipeline redan använder

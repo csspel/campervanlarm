@@ -83,7 +83,7 @@ static void mqttPublishAck(uint32_t ackMsgId, const char *status, const char *de
 
   const ProfileConfig &p = currentProfile();
 
-  // {"device_id":"...","type":"ACK","ack_msg_id":1234,"status":"OK","detail":"...","profile":"ALARM","fw":"...","epoch_utc":...}
+  // {"device_id":"...","type":"ACK","ack_msg_id":1234,"status":"OK","detail":"...","profile":"ARMED","fw":"...","epoch_utc":...}
   String payload = "{";
   payload += "\"device_id\":\"" + String(DEVICE_ID) + "\",";
   payload += "\"type\":\"ACK\",";
@@ -143,9 +143,6 @@ static void mqttCallback(char *topic, uint8_t *payload, unsigned int length)
   if (t != MQTT_TOPIC_DOWNLINK)
     return;
 
-  // Backwards compatible format:
-  //  {"ack_msg_id":123,"desired_profile":"ALARM"}
-  //
   // Robustness:
   // - kräver ack_msg_id
   // - dedupe så retained inte körs om igen
@@ -399,11 +396,21 @@ bool mqttPublishGpsSingle(const GpsFix &fx, bool fixOk)
   payload += "\"fix_mode\":" + String(fx.fix_mode) + ",";
 
   // Positionfält (om valid, annars ändå 0.0 så Node-RED kan logga)
-  payload += "\"lat\":" + String(fx.lat, 6) + ",";
-  payload += "\"lon\":" + String(fx.lon, 6) + ",";
-  payload += "\"speed_kmh\":" + String(fx.speed_kmh, 1) + ",";
-  payload += "\"course_deg\":" + String(fx.course_deg, 1) + ",";
-  payload += "\"alt_m\":" + String(fx.alt_m, 1);
+  if (fixOk)
+  {
+    payload += "\"lat\":" + String(fx.lat, 6) + ",";
+    payload += "\"lon\":" + String(fx.lon, 6) + ",";
+    payload += "\"speed_kmh\":" + String(fx.speed_kmh, 1) + ",";
+    payload += "\"course_deg\":" + String(fx.course_deg, 1) + ",";
+    payload += "\"alt_m\":" + String(fx.alt_m, 1);
+  }
+  else
+  {
+    // UC-01 val A: inga lat/lon när fix saknas
+    payload += "\"speed_kmh\":0.0,";
+    payload += "\"course_deg\":0.0,";
+    payload += "\"alt_m\":0.0";
+  }
 
   payload += "}";
 
