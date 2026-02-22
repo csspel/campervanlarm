@@ -1,0 +1,268 @@
+src/config.h
+
+Roll: Central hårdvaru-/runtime-konfiguration: pinout, APN, timeouts, topic-strängar, GPS-filtergränser samt inkludering av secrets.h om den finns.
+
+Innehåll (ingen funktion kod här):
+
+Modem-UART pins, I2C-pins (PMU), PIR-pins, APN, nät-timeouts.
+
+MQTT topics (van/ellie/...) och device-id.
+
+GPS “quality gates” (HDOP-gränser, sat-min, placeholder 62/15-filter etc).
+
+src/gps.h
+
+Roll: Publikt API och datastruktur för GPS-fix från SIM7080 (AT+CGNSINF).
+
+Struktur
+
+struct GpsFix – innehåller fix-data + diagnostik (lat/lon, hdop, sats_used, fix_status, start_mode, ttff etc).
+
+Publika funktioner
+
+gpsInit() – init av GPS-modulen (logik/variabler).
+
+gpsPowerOn() / gpsPowerOff() – slår GPS på/av via AT-kommandon och uppdaterar intern state.
+
+gpsIsOn() – returnerar om GPS anses vara på.
+
+gpsGetFixWait(GpsFix &out, uint32_t maxWaitMs=30000) – blockerande väntan på fix (finns kvar men pipeline kör non-blocking).
+
+gpsPollOnce(GpsFix &out) – läser en gång (non-blocking poll) och kör parsing + gates.
+
+gpsHasLastFix() / gpsLastFix() / gpsLastFixAtMs() – access till senast godkända fix + tidsstämpel.
+
+src/gps.cpp
+
+Roll: Implementerar GPS-API:t ovan. Pratar med modemet via samma UART som TinyGSM använder (SerialAT).
+
+Viktiga interna delar
+
+Minimal AT-hjälpare: atFlush(), atWaitOk(), atCmdOk(), atCmdGetLine() (skickar AT och läser rader/OK).
+
+Startmode-logik: väljer HOT/WARM/COLD beroende på tidsvaliditet och ålder på last fix (pickStartCmd() m.fl.).
+
+Kvalitetsgates:
+
+sanityOk(), qualityGate() (run_status, sats, hdop, fix_status, placeholder 62/15 osv)
+
+stabilityGate() + haversine-distans för “N bra prover i rad” (stabilitetskrav).
+
+Parsing av +CGNSINF (bygger GpsFix).
+
+Publika funktioner (se gps.h)
+
+gpsInit, gpsPowerOn/Off, gpsIsOn, gpsGetFixWait, gpsPollOnce, gpsHasLastFix, gpsLastFix, gpsLastFixAtMs.
+
+src/logging.h
+
+Roll: Ett litet logg-API som resten av systemet använder.
+
+Funktioner
+
+loggingInit() – init av loggsystem.
+
+logSystem(const String &msg) – skriver en loggrad (med prefix) till Serial + ringbuffer.
+
+loggingFlush(...) och loggingFlushIdle() – kvar för kompatibilitet (no-op när SD är av).
+
+src/logging.cpp
+
+Roll: Implementerar RAM+Serial-loggning, SD avstängt. Har en liten ringbuffer i RAM för senaste rader.
+
+Funktioner
+
+loggingInit() – skriver banner “RAM-only logging”.
+
+logSystem(msg) – bygger prefix (lokal tid om finns annars fallback) och pushar till ringbuffer.
+
+loggingFlush(...), loggingFlushIdle() – no-op.
+
+(Interna helpers: makePrefix(), ringPush().)
+
+src/main.cpp
+
+Roll: Minimal “boot + loop” som bara initierar moduler och sedan kör pipeline.
+
+Funktioner
+
+setup() – initar Serial, time, profiler, power, logging, modem UART/pins, mqtt, pipeline.
+
+loop() – kör pipelineTick(millis()).
+
+(Obs: du har fortfarande SD-log-suppression i setup via esp_log_level_set("sdmmc_*"... ) som är SD-rester.)
+
+src/modem.h
+
+Roll: Publikt API för modem: init, nätattach, RF on/off, powercycle, samt klient till MQTT (TinyGSMClient).
+
+Funktioner
+
+modemInitUartAndPins() – init UART + GPIO (PWR/DTR/RI).
+
+modemConnectData(apn, netRegTimeout, dataAttachTimeout, out) – nätregistrering + data-bearer + IP/CSQ i NetResult.
+
+Client& modemGetClient() – returnerar TinyGSMClient för MQTT-stacken.
+
+modemGetCclk(out, timeout) – läser modemtiden via AT+CCLK?.
+
+modemRfOn() / modemRfOff() – styr CFUN (RF on/off).
+
+modemPowerCycle(offMs, bootMs) – PWRKEY-sekvens för att “starta om” modemet.
+
+src/modem.cpp
+
+Roll: Implementerar modem-API. TinyGSM + SerialAT(1) är globalt.
+
+Viktiga interna helpers
+
+modemWaitForAT(), modemWaitForSimReady(), modemWaitForNetwork() – väntar och loggar progress.
+
+modemActivateData() – försöker aktivera datalänk (CNACT) och verifierar GPRS status.
+
+modemSetCfun(mode, timeout) – helper som skickar +CFUN=.
+
+Publika funktioner
+
+(se listan under modem.h)
+
+src/mqtt.h
+
+Roll: Publikt API för MQTT-delen (setup/connect/loop + publish för version/alive/gps/pir).
+
+Funktioner
+
+mqttSetup() – init klient, callbacks, topics, etc.
+
+mqttConnect() / mqttDisconnect() / mqttIsConnected() – anslutning/livscykel.
+
+mqttLoop() / mqttLoopFor(durationMs) – pumpa klienten och ta emot messages.
+
+mqttPublishVersion(retain) – publicera version (ofta retained).
+
+mqttPublishAlive() – publicera alive-payload.
+
+mqttPublishGpsSingle(const GpsFix&, bool fixOk) – publicera single GPS (inkl fix_ok).
+
+mqttPublishPirEvent(eventId, count, firstMs, lastMs, srcMask) – publicera PIR-event.
+
+src/mqtt.cpp
+
+Roll: Implementerar MQTT-API + parsing av downlink + ack-hantering (retained downlink).
+
+Nyckelfunktioner (både interna och publika)
+
+mqttCallback(topic, payload, length) – tar emot downlink/ack och triggar hooks.
+
+mqttPublishAck(ackMsgId, status, detail) – skickar van/ellie/ack (device → HA) när downlink applicerats.
+
+clearRetainedDownlink() – rensar retained downlink (publicerar tom payload).
+
+jsonGetString(...), jsonGetUInt(...) – små JSON-helpers (sträng/uint ur payload).
+
+Publika: mqttSetup, mqttConnect, mqttLoop, mqttDisconnect, mqttIsConnected, mqttPublishVersion, mqttPublishAlive, mqttPublishGpsSingle, mqttPublishPirEvent.
+
+src/pipeline.h
+
+Roll: Publikt API för state machine (“pipeline”).
+
+Funktioner
+
+pipelineInit() – init av pipeline, ISR-kopplingar etc.
+
+pipelineTick(nowMs) – kör state machine stegvis.
+
+pipelineOnPirAck(eventId) – hook från MQTT när HA ackar PIR-event.
+
+pipelineOnProfileChanged(newProfile) – hook när profil ändras.
+
+src/pipeline.cpp
+
+Roll: Själva state machine som koordinerar GPS ↔ RF ↔ MQTT och PIR-hantering.
+
+Nyckelidéer
+
+PIR-outbox som kräver server-ack: samlar triggers från ISR, skickar event, väntar ack.
+
+Steg/State machine: STEP_GPS_ON/WARMUP/COLLECT/OFF, STEP_RF_ON, STEP_NET_ATTACH, STEP_MQTT_CONNECT, STEP_PUBLISH, STEP_RX_DOWNLINK, STEP_RF_OFF, samt väntesteg.
+
+Viktigt: den stänger RF (CFUN=0) innan GPS, pga GNSS/LTE-mux i SIM7080.
+
+Funktioner (viktigaste)
+
+ISR: isrPirFront(), isrPirBack() – samlar PIR triggers.
+
+pirIngestIsr(nowMs) – flyttar ISR-räknare till en “pending event”-struktur.
+
+stepEnter(step, nowMs) / stepTimedOut(nowMs) – driver state machine deadlines.
+
+Publika hooks + init/tick: pipelineOnPirAck, pipelineOnProfileChanged, pipelineInit, pipelineTick.
+
+src/power.h / src/power.cpp
+
+Roll: Init av PMU och “power rails” för modem (AXP2101).
+Funktioner: powerInit() – initar PMU och slår på modemets matning. (I din repo är filerna väldigt kompakta, men detta är avsikten via headern.)
+
+src/profiles.h
+
+Roll: Profiler + konfiguration per profil (gpsInterval, commInterval, fixWait, PIR enable).
+
+Typer
+
+enum class ProfileId { TRAVEL, PARKED, ALARM, STOLEN } (OBS: detta är “gamla” namn, inte nya ARMED/TRIGGERED).
+
+struct ProfileConfig – intervall och PIR flags.
+
+Funktioner
+
+profilesInit(defaultProfile) – initar profilstate.
+
+currentProfile() – returnerar aktiv profilkonfig.
+
+setProfile(id) – byter profil och triggar pipelineOnProfileChanged.
+
+profileName(id) – stringnamn.
+
+profileFromString(s, out) – parse från text (t.ex. MQTT desired_profile).
+
+src/profiles.cpp
+
+Roll: Implementerar profil-tabell och parsing/byte.
+(Funktionerna listade ovan.)
+
+src/time_manager.h
+
+Roll: Tidssynk + formattering (UTC epoch + lokalt datum/klocka).
+
+Funktioner
+
+timeInit() – sätter TZ + init state.
+
+timeIsValid() – sanity check på tid.
+
+timeGetSource() – senaste synkkälla (NONE/MODEM/NTP).
+
+timeLastSyncEpochUtc() – när senaste sync skedde.
+
+timeSyncFromModem(timeout) – läser AT+CCLK? via modem och sätter systemtid.
+
+timeSyncFromNtp(timeout) – SNTP över IP.
+
+Getters/format:
+
+timeEpochUtc(), timeIsoUtc(), timeDateLocal(), timeClockLocal()
+
+src/time_manager.cpp
+
+Roll: Implementerar synk/parsing och formattering.
+Interna helpers du kommer se:
+
+parsing av CCLK-sträng till epoch, samt “set system time”.
+
+src/secrets_example.h
+
+Roll: Exempel-/fallback-secrets (MQTT host/user/pass etc) som används om riktig secrets.h saknas.
+
+platformio.ini
+
+Roll: PlatformIO-projektkonfig: board, framework, libs, build flags etc.
