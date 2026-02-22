@@ -17,11 +17,6 @@
 #define BOARD_I2C_SDA 15
 #define BOARD_I2C_SCL 7
 
-// ---------------- SD_MMC (1-bit) ----------------------------
-static const int PIN_SD_CLK = 38;
-static const int PIN_SD_CMD = 39;
-static const int PIN_SD_D0 = 40;
-
 // ---------------- PIR (campervan) ---------------------------
 // Du har tidigare använt GPIO9 & GPIO17 för PIR på ESP32-S3.
 static const int PIN_PIR_FRONT = 9;

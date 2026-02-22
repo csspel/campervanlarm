@@ -24,7 +24,7 @@ struct PirOutbox
 static PirOutbox g_pir;
 static volatile uint16_t g_pirIsrCount = 0;
 static volatile uint8_t g_pirIsrMask = 0; // bit0=front, bit1=back
-static uint32_t g_nextEventId = 1;        // TODO: persist i NVS/SD senare
+static uint32_t g_nextEventId = 1;        // TODO: persist i NVS senare
 static bool g_alarmGpsSkipUsed = false;   // skip GPS EN gång per ALARM-episod
 
 static void IRAM_ATTR isrPirFront()
