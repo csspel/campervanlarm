@@ -12,16 +12,16 @@ static ProfileConfig profileTable[] = {
         ProfileId::PARKED, "PARKED",
         5 * 60 * 1000UL, // gpsIntervalMs (single vid alive-cykel)
         5 * 60 * 1000UL, // commIntervalMs
-        60 * 1000UL,     // gpsFixWaitMs (per cykel, kan justeras senare)
+        0 * 60 * 1000UL, // gpsFixWaitMs (per cykel, kan justeras senare)
         false, false     // PIR OFF
     },
 
     // TRAVEL (disarmed)
     {
         ProfileId::TRAVEL, "TRAVEL",
-        10 * 1000UL,     // gpsIntervalMs (sample för batch, dt=10s)
+        0 * 1000UL,      // var 10 gpsIntervalMs (sample för batch, dt=10s)
         5 * 60 * 1000UL, // commIntervalMs (batch + alive var 5 min)
-        30 * 1000UL,     // gpsFixWaitMs
+        0 * 30 * 1000UL, // gpsFixWaitMs
         false, false     // PIR OFF
     },
 
@@ -30,17 +30,17 @@ static ProfileConfig profileTable[] = {
         ProfileId::ARMED, "ARMED",
         30 * 60 * 1000UL, // gpsIntervalMs (om du ens tar GPS här - kan vara samma som comm)
         30 * 60 * 1000UL, // commIntervalMs (alive var 30 min)
-        60 * 1000UL,      // gpsFixWaitMs
+        0 * 60 * 1000UL,  // gpsFixWaitMs
         true, true        // PIR ON
     },
 
     // TRIGGERED (utlöst larm)
     {
         ProfileId::TRIGGERED, "TRIGGERED",
-        15 * 1000UL, // gpsIntervalMs (single var 15s)
-        15 * 1000UL, // commIntervalMs (alive var 15s)
-        15 * 1000UL, // gpsFixWaitMs
-        false, false // PIR OFF (PIR är bara i ARMED)
+        15 * 1000UL,     // gpsIntervalMs (single var 15s)
+        15 * 1000UL,     // commIntervalMs (alive var 15s)
+        0 * 15 * 1000UL, // gpsFixWaitMs
+        false, false     // PIR OFF (PIR är bara i ARMED)
     },
 };
 

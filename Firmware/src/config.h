@@ -105,3 +105,7 @@ constexpr double GPS_PLACEHOLDER_LAT = 62.0;
 constexpr double GPS_PLACEHOLDER_LON = 15.0;
 constexpr double GPS_PLACEHOLDER_LAT_TOL = 0.05;
 constexpr double GPS_PLACEHOLDER_LON_TOL = 0.05;
+
+// DEV: håll GPS väntetid kort så utveckling inte blockas
+constexpr uint32_t GPS_DEV_MAX_WAIT_MS = 8000UL; // 8s (justera)
+constexpr bool GPS_DEV_CAP_WAIT = true;
