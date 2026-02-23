@@ -9,6 +9,7 @@
 #include "time_manager.h"
 #include "config.h"
 
+#include <stdarg.h>
 #include <Arduino.h>
 
 #ifndef LOG_RING_LINES
@@ -52,4 +53,15 @@ void logSystem(const String &msg)
   String line = makePrefix() + msg;
   Serial.println(line);
   ringPush(line);
+}
+
+void logSystemf(const char *fmt, ...)
+{
+  char buf[160]; // öka/minska vid behov
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+
+  logSystem(String(buf));
 }

@@ -161,7 +161,7 @@ static void mqttCallback(char *topic, uint8_t *payload, unsigned int length)
   if (ackId == lastAckMsgId)
   {
     mqttPublishAck(ackId, "DUPLICATE_IGNORED", "same_ack_msg_id");
-    clearRetainedDownlink();
+    // clearRetainedDownlink();
     return;
   }
   lastAckMsgId = ackId;
@@ -186,7 +186,7 @@ static void mqttCallback(char *topic, uint8_t *payload, unsigned int length)
   }
 
   // Viktigt: rensa retained så den inte triggar igen vid nästa connect
-  clearRetainedDownlink();
+  // clearRetainedDownlink();
 }
 
 // ----------------- Public API -----------------
@@ -352,7 +352,10 @@ bool mqttPublishPirEvent(uint32_t eventId, uint16_t count, uint32_t firstMs, uin
 
   bool ok = mqttClient->publish(MQTT_TOPIC_PIR, payload.c_str(), false);
   logSystem(String("MQTT: PIR publish ") + (ok ? "OK" : "FAIL") +
-            " event_id=" + String(eventId) + " count=" + String(count));
+            " topic=" + String(MQTT_TOPIC_PIR) +
+            " event_id=" + String(eventId) +
+            " src_mask=" + String(srcMask) +
+            " count=" + String(count));
   return ok;
 }
 
