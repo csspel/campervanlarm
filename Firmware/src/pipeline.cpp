@@ -22,6 +22,16 @@ struct PirOutbox
     uint8_t src_mask = 0; // bit0=front, bit1=back
 };
 
+// ---- Lockout: max 1 MQTT/min per PIR ----
+static uint32_t g_pirIgnoreFrontUntilMs = 0;
+static uint32_t g_pirIgnoreBackUntilMs = 0;
+static const uint32_t PIR_LOCKOUT_MS = 60UL * 1000UL;
+
+// ---- Filter: max 1 accepted trigger/s per PIR (för logg + vidare bearbetning) ----
+static uint32_t g_lastPirAcceptedFrontMs = 0;
+static uint32_t g_lastPirAcceptedBackMs = 0;
+static const uint32_t PIR_ACCEPT_MIN_GAP_MS = 1000UL; // 1 Hz
+
 static PirOutbox g_pir;
 
 static volatile uint16_t g_pirIsrCount = 0;
@@ -40,7 +50,7 @@ static const uint32_t ARMED_AWAKE_MAX_MS = 2UL * 60UL * 60UL * 1000UL; // 2 h
 static const uint32_t ARMED_AWAKE_COMM_MS = 2UL * 60UL * 1000UL;       // alive var 2 min
 static uint32_t g_nextAwakeAliveAtMs = 0;
 
-// ---- PIR throttle: max 1/min per PIR ----
+// ---- Publish-rate limiter: max 1/min per PIR ----
 static uint32_t g_lastPirPublishFrontMs = 0;
 static uint32_t g_lastPirPublishBackMs = 0;
 static const uint32_t PIR_THROTTLE_MS = 60UL * 1000UL;
@@ -57,6 +67,32 @@ static void IRAM_ATTR isrPirBack()
     g_pirIsrMask |= 0x02;
 }
 
+// ---------- helpers ----------
+static inline bool isBefore(uint32_t nowMs, uint32_t untilMs)
+{
+    return (int32_t)(nowMs - untilMs) < 0;
+}
+
+static void pirStartOrExtendAwake(uint32_t nowMs)
+{
+    if (!g_armedAwakeActive)
+    {
+        g_armedAwakeActive = true;
+        g_armedAwakeStartMs = nowMs;
+        g_armedAwakeUntilMs = nowMs + ARMED_AWAKE_WINDOW_MS;
+        g_nextAwakeAliveAtMs = nowMs;
+    }
+    else
+    {
+        uint32_t proposed = nowMs + ARMED_AWAKE_WINDOW_MS;
+        uint32_t cap = g_armedAwakeStartMs + ARMED_AWAKE_MAX_MS;
+        g_armedAwakeUntilMs = (proposed < cap) ? proposed : cap;
+    }
+}
+
+// ==============================
+// PIR ingest (ISR -> filtered -> lockout -> outbox)
+// ==============================
 static void pirIngestIsr(uint32_t nowMs)
 {
     uint16_t n;
@@ -73,16 +109,68 @@ static void pirIngestIsr(uint32_t nowMs)
     if (p.id != ProfileId::ARMED)
         return;
 
-    if (n == 0)
+    if (n == 0 || mask == 0)
         return;
 
-    const char *which = (mask == 0x01)   ? "FRONT"
-                        : (mask == 0x02) ? "BACK"
-                        : (mask == 0x03) ? "FRONT+BACK"
-                                         : "UNKNOWN";
+    // ---- Step 1: Lockout filter (ignorera helt under lockout) ----
+    uint8_t lockoutFiltered = mask;
 
-    logSystemf("PIR: TRIGGERED (ARMED) which=%s n=%u mask=0x%02X", which, (unsigned)n, (unsigned)mask);
+    if ((lockoutFiltered & 0x01) && isBefore(nowMs, g_pirIgnoreFrontUntilMs))
+        lockoutFiltered &= ~0x01;
 
+    if ((lockoutFiltered & 0x02) && isBefore(nowMs, g_pirIgnoreBackUntilMs))
+        lockoutFiltered &= ~0x02;
+
+    if (lockoutFiltered == 0)
+    {
+        // Allt låg i lockout -> ignorera tyst (eller logga vid behov)
+        // logSystemf("PIR: LOCKOUT (ignored) mask=0x%02X", (unsigned)mask);
+        return;
+    }
+
+    // ---- Step 2: 1 Hz accept per PIR (för att inte spamma logg & outbox) ----
+    uint8_t acceptedMask = 0;
+
+    // FRONT
+    if (lockoutFiltered & 0x01)
+    {
+        if (g_lastPirAcceptedFrontMs == 0 ||
+            (int32_t)(nowMs - g_lastPirAcceptedFrontMs) >= (int32_t)PIR_ACCEPT_MIN_GAP_MS)
+        {
+            acceptedMask |= 0x01;
+            g_lastPirAcceptedFrontMs = nowMs;
+        }
+    }
+
+    // BACK
+    if (lockoutFiltered & 0x02)
+    {
+        if (g_lastPirAcceptedBackMs == 0 ||
+            (int32_t)(nowMs - g_lastPirAcceptedBackMs) >= (int32_t)PIR_ACCEPT_MIN_GAP_MS)
+        {
+            acceptedMask |= 0x02;
+            g_lastPirAcceptedBackMs = nowMs;
+        }
+    }
+
+    if (acceptedMask == 0)
+    {
+        // Triggers kom, men vi tar max 1/s -> ignoreras
+        // Logga sparsamt: här loggar vi varje gång vi *har ISR-data* men inget accepteras
+        logSystemf("PIR: FILTERED (rate-limit 1Hz) raw_n=%u raw_mask=0x%02X", (unsigned)n, (unsigned)mask);
+        return;
+    }
+
+    const char *which = (acceptedMask == 0x01)   ? "FRONT"
+                        : (acceptedMask == 0x02) ? "BACK"
+                        : (acceptedMask == 0x03) ? "FRONT+BACK"
+                                                 : "UNKNOWN";
+
+    // Detta är de triggers som “kommer vidare” (max 1/s per PIR) och syns i loggen
+    logSystemf("PIR: FILTERED (accepted) which=%s raw_n=%u raw_mask=0x%02X accepted_mask=0x%02X",
+               which, (unsigned)n, (unsigned)mask, (unsigned)acceptedMask);
+
+    // ---- Step 3: Lägg i outbox (men queue:a inte för senare throttle; vi använder lockout för det) ----
     if (!g_pir.pending)
     {
         g_pir.pending = true;
@@ -94,24 +182,20 @@ static void pirIngestIsr(uint32_t nowMs)
         g_pir.src_mask = 0;
     }
 
-    g_pir.count = (uint16_t)(g_pir.count + n);
-    g_pir.last_ms = nowMs;
-    g_pir.src_mask |= mask;
+    // Vi räknar 1 per accepterad “sekund-tick” per sensor (inte raw_n)
+    // så count blir “antal sekunder med rörelse” ungefär, inte brus.
+    uint16_t add = 0;
+    if (acceptedMask & 0x01)
+        add++;
+    if (acceptedMask & 0x02)
+        add++;
 
-    // Starta / förläng ARMED_AWAKE (sliding window) med max-tak 2h
-    if (!g_armedAwakeActive)
-    {
-        g_armedAwakeActive = true;
-        g_armedAwakeStartMs = nowMs;
-        g_armedAwakeUntilMs = nowMs + ARMED_AWAKE_WINDOW_MS;
-        g_nextAwakeAliveAtMs = nowMs;
-    }
-    else
-    {
-        uint32_t proposed = nowMs + ARMED_AWAKE_WINDOW_MS;
-        uint32_t cap = g_armedAwakeStartMs + ARMED_AWAKE_MAX_MS;
-        g_armedAwakeUntilMs = (proposed < cap) ? proposed : cap;
-    }
+    g_pir.count = (uint16_t)(g_pir.count + add);
+    g_pir.last_ms = nowMs;
+    g_pir.src_mask |= acceptedMask;
+
+    // Starta / förläng ARMED_AWAKE
+    pirStartOrExtendAwake(nowMs);
 }
 
 // ==============================
@@ -175,13 +259,13 @@ static void stepEnter(Step s, uint32_t nowMs)
         break;
 
     case Step::STEP_GPS_WARMUP:
-        g_deadlineMs = nowMs + 1500UL; // 1.5 s settle time
+        g_deadlineMs = nowMs + 1500UL;
         break;
 
     case Step::STEP_GPS_COLLECT:
         g_deadlineMs = nowMs + g_gpsCollectTimeoutMs;
-        g_gpsNextPollMs = nowMs;      // poll direkt
-        g_gpsPollIntervalMs = 1000UL; // börja lugnt
+        g_gpsNextPollMs = nowMs;
+        g_gpsPollIntervalMs = 1000UL;
         break;
 
     case Step::STEP_GPS_OFF:
@@ -190,7 +274,7 @@ static void stepEnter(Step s, uint32_t nowMs)
         break;
 
     case Step::STEP_RF_ON:
-        gpsPowerOff(); // säkerställ GNSS OFF innan RF
+        gpsPowerOff();
         g_deadlineMs = nowMs + 200UL;
         break;
 
@@ -209,7 +293,7 @@ static void stepEnter(Step s, uint32_t nowMs)
     case Step::STEP_RX_DOWNLINK:
         if (currentProfile().id == ProfileId::ARMED && g_armedAwakeActive)
         {
-            g_deadlineMs = g_armedAwakeUntilMs; // lyssna tills awake-window slut
+            g_deadlineMs = g_armedAwakeUntilMs;
         }
         else
         {
@@ -228,9 +312,6 @@ static void stepEnter(Step s, uint32_t nowMs)
         break;
 
     case Step::STEP_ALARM_WAIT:
-        g_deadlineMs = g_nextCommAtMs;
-        break;
-
     case Step::STEP_PARKED_WAIT:
         g_deadlineMs = g_nextCommAtMs;
         break;
@@ -243,49 +324,50 @@ static bool stepTimedOut(uint32_t nowMs)
 }
 
 // ------------------------------
-// Helpers: PIR throttle decision
+// Helpers: PIR publish eligibility (per PIR, 1/min)
 // ------------------------------
-static bool pirThrottleAllowsNow(uint32_t nowMs)
+static bool pirCanPublishNow(uint32_t nowMs)
 {
     if (!g_pir.pending)
         return false;
 
     bool allow = false;
 
-    // FRONT
     if (g_pir.src_mask & 0x01)
     {
-        // last==0 betyder "aldrig publicerat" -> tillåt direkt
         if (g_lastPirPublishFrontMs == 0 ||
             (int32_t)(nowMs - g_lastPirPublishFrontMs) >= (int32_t)PIR_THROTTLE_MS)
-        {
             allow = true;
-        }
     }
 
-    // BACK
     if (g_pir.src_mask & 0x02)
     {
         if (g_lastPirPublishBackMs == 0 ||
             (int32_t)(nowMs - g_lastPirPublishBackMs) >= (int32_t)PIR_THROTTLE_MS)
-        {
             allow = true;
-        }
     }
 
     return allow;
 }
 
-static void pirThrottleMarkPublished(uint32_t nowMs)
+static void pirMarkPublishedAndLockout(uint32_t nowMs)
 {
     if (!g_pir.pending)
         return;
 
+    // FRONT
     if (g_pir.src_mask & 0x01)
+    {
         g_lastPirPublishFrontMs = nowMs;
+        g_pirIgnoreFrontUntilMs = nowMs + PIR_LOCKOUT_MS;
+    }
 
+    // BACK
     if (g_pir.src_mask & 0x02)
+    {
         g_lastPirPublishBackMs = nowMs;
+        g_pirIgnoreBackUntilMs = nowMs + PIR_LOCKOUT_MS;
+    }
 }
 
 // ==============================
@@ -309,11 +391,9 @@ void pipelineOnPirAck(uint32_t eventId)
 
 void pipelineOnProfileChanged(ProfileId newProfile)
 {
-    // Nollställ “skip GPS en gång” vid profilbyte
     g_alarmGpsSkipUsed = false;
     (void)newProfile;
 
-    // När vi lämnar ARMED: stäng ARMED_AWAKE och rensa PIR outbox
     if (newProfile != ProfileId::ARMED)
     {
         g_armedAwakeActive = false;
@@ -324,6 +404,10 @@ void pipelineOnProfileChanged(ProfileId newProfile)
         g_pir.acked = false;
         g_pir.count = 0;
         g_pir.src_mask = 0;
+
+        // nollställ accept-filter också
+        g_lastPirAcceptedFrontMs = 0;
+        g_lastPirAcceptedBackMs = 0;
     }
 }
 
@@ -337,7 +421,6 @@ void pipelineInit()
 
     g_nextCommAtMs = millis() + 2000UL;
 
-    // PIR för test (pull-down så vi inte får spök-trigger på S3-DevKitC)
     pinMode(PIN_PIR_FRONT, INPUT_PULLDOWN);
     pinMode(PIN_PIR_BACK, INPUT_PULLDOWN);
     attachInterrupt(digitalPinToInterrupt(PIN_PIR_FRONT), isrPirFront, RISING);
@@ -353,16 +436,12 @@ void pipelineTick(uint32_t nowMs)
 
     switch (g_step)
     {
-    // ---------------- DECIDE ----------------
     case Step::STEP_DECIDE:
     {
         const auto &p = currentProfile();
 
-        // Stäng ARMED_AWAKE när tiden gått ut
         if (g_armedAwakeActive && (int32_t)(nowMs - g_armedAwakeUntilMs) >= 0)
-        {
             g_armedAwakeActive = false;
-        }
 
         bool commDue = ((int32_t)(nowMs - g_nextCommAtMs) >= 0);
         g_needComm = g_pir.pending || commDue;
@@ -380,7 +459,6 @@ void pipelineTick(uint32_t nowMs)
         {
             if (p.id == ProfileId::ARMED)
             {
-                // Skip GPS exakt en gång per ARMED-episod (när PIR pending första gången)
                 if (g_pir.pending && !g_alarmGpsSkipUsed)
                 {
                     g_gpsPlan = GpsPlan::NONE;
@@ -390,20 +468,14 @@ void pipelineTick(uint32_t nowMs)
                 {
                     g_gpsPlan = (p.gpsFixWaitMs > 0) ? GpsPlan::SINGLE : GpsPlan::NONE;
                     if (p.gpsFixWaitMs > 0)
-                    {
-                        // Låt profilen styra – ingen 5-min tvingning
                         g_gpsCollectTimeoutMs = p.gpsFixWaitMs;
-                    }
                 }
             }
             else
             {
-                // PARKED/TRAVEL: single fix om fixWaitMs > 0
                 g_gpsPlan = (p.gpsFixWaitMs > 0) ? GpsPlan::SINGLE : GpsPlan::NONE;
                 if (p.gpsFixWaitMs > 0)
-                {
                     g_gpsCollectTimeoutMs = p.gpsFixWaitMs;
-                }
             }
         }
 
@@ -416,7 +488,6 @@ void pipelineTick(uint32_t nowMs)
             break;
         }
 
-        // Kör pipeline
         if (g_gpsPlan != GpsPlan::NONE)
             stepEnter(Step::STEP_GPS_ON, nowMs);
         else
@@ -437,7 +508,6 @@ void pipelineTick(uint32_t nowMs)
 
     case Step::STEP_GPS_COLLECT:
     {
-        // Non-blocking: poll CGNSINF tills valid (stabilitet+quality gate) eller deadline.
         if ((int32_t)(nowMs - g_gpsNextPollMs) >= 0)
         {
             g_gpsNextPollMs = nowMs + g_gpsPollIntervalMs;
@@ -446,11 +516,8 @@ void pipelineTick(uint32_t nowMs)
             bool ok = gpsPollOnce(fx);
             if (ok)
             {
-                // Adaptiv poll: när vi ser kandidat, poll:a snabbare så vi snabbare får 2 stabila prover
                 if (fx.candidate && !fx.valid)
-                {
                     g_gpsPollIntervalMs = 500UL;
-                }
 
                 if (fx.valid)
                 {
@@ -465,7 +532,6 @@ void pipelineTick(uint32_t nowMs)
 
         if (stepTimedOut(nowMs))
         {
-            // timeout: fortsätt ändå utan GPS
             g_gpsHave = false;
             g_gpsFixOk = false;
             logSystem("GPS: timeout (no valid fix)");
@@ -489,7 +555,6 @@ void pipelineTick(uint32_t nowMs)
         bool ok = modemConnectData(APN, NET_REG_TIMEOUT_MS, DATA_ATTACH_TIMEOUT_MS, net);
         if (ok)
         {
-            // sync time best effort
             timeSyncFromModem();
             timeSyncFromNtp(8000);
             stepEnter(Step::STEP_MQTT_CONNECT, nowMs);
@@ -521,28 +586,30 @@ void pipelineTick(uint32_t nowMs)
 
     case Step::STEP_PUBLISH:
     {
-        // GPS (single)
         if (g_gpsHave)
-        {
             mqttPublishGpsSingle(g_gpsFix, g_gpsFixOk);
-        }
 
-        // PIR event (throttle: max 1/min per PIR)
+        // PIR: publish om tillåtet just nu, annars DROPPAR vi (lockout-mode, ingen kö)
         if (g_pir.pending)
         {
-            if (pirThrottleAllowsNow(nowMs))
+            if (pirCanPublishNow(nowMs))
             {
-                // Markera publish-time för de sensorer som var med i eventet
-                pirThrottleMarkPublished(nowMs);
+                pirMarkPublishedAndLockout(nowMs);
                 mqttPublishPirEvent(g_pir.event_id, g_pir.count, g_pir.first_ms, g_pir.last_ms, g_pir.src_mask);
             }
             else
             {
-                logSystem("PIR: throttled (no publish this cycle)");
+                // Viktigt: INGEN “queue till nästa minut”
+                logSystem("PIR: blocked by 1/min rule -> drop (lockout mode, no queue)");
+                g_pir.pending = false;
+                g_pir.acked = false;
+                g_pir.count = 0;
+                g_pir.first_ms = 0;
+                g_pir.last_ms = 0;
+                g_pir.src_mask = 0;
             }
         }
 
-        // Alive
         mqttPublishAlive();
 
         stepEnter(Step::STEP_RX_DOWNLINK, nowMs);
@@ -553,15 +620,27 @@ void pipelineTick(uint32_t nowMs)
     {
         mqttLoop();
 
-        // ARMED_AWAKE: håll MQTT uppe kontinuerligt och skicka alive var 2 min.
-        // ***FIX***: om ny PIR pending och throttlen tillåter -> bryt RX och publicera direkt.
         if (currentProfile().id == ProfileId::ARMED && g_armedAwakeActive)
         {
-            // Om PIR kom in under RX: publicera (max 1/min) direkt
-            if (g_pir.pending && pirThrottleAllowsNow(nowMs))
+            // Ny PIR pending under RX: om 1/min-regeln tillåter, publicera direkt.
+            // Om inte tillåter => droppa direkt så den inte “skjuts upp”.
+            if (g_pir.pending)
             {
-                stepEnter(Step::STEP_PUBLISH, nowMs);
-                break;
+                if (pirCanPublishNow(nowMs))
+                {
+                    stepEnter(Step::STEP_PUBLISH, nowMs);
+                    break;
+                }
+                else
+                {
+                    logSystem("PIR: pending during RX but blocked by 1/min -> drop");
+                    g_pir.pending = false;
+                    g_pir.acked = false;
+                    g_pir.count = 0;
+                    g_pir.first_ms = 0;
+                    g_pir.last_ms = 0;
+                    g_pir.src_mask = 0;
+                }
             }
 
             // Periodisk alive (2 min)
@@ -571,22 +650,17 @@ void pipelineTick(uint32_t nowMs)
                 g_nextAwakeAliveAtMs = nowMs + ARMED_AWAKE_COMM_MS;
             }
 
-            // Avsluta awake-window när tiden gått ut
             if ((int32_t)(nowMs - g_armedAwakeUntilMs) >= 0)
             {
                 g_armedAwakeActive = false;
                 stepEnter(Step::STEP_MQTT_DISCONNECT, nowMs);
             }
-
-            // Annars: stanna här och fortsätt lyssna
             break;
         }
 
-        // Normal RX-window (ej ARMED_AWAKE)
         if (stepTimedOut(nowMs))
-        {
             stepEnter(Step::STEP_MQTT_DISCONNECT, nowMs);
-        }
+
         break;
     }
 
@@ -596,16 +670,13 @@ void pipelineTick(uint32_t nowMs)
 
     case Step::STEP_RF_OFF:
     {
-        // Schemalägg nästa comm enligt profil (ARMED_AWAKE => 2 min)
         const auto &p = currentProfile();
         uint32_t effectiveCommMs = p.commIntervalMs;
         if (p.id == ProfileId::ARMED && g_armedAwakeActive)
-        {
             effectiveCommMs = ARMED_AWAKE_COMM_MS;
-        }
+
         g_nextCommAtMs = nowMs + effectiveCommMs;
 
-        // Gå till WAIT enligt profil
         if (p.id == ProfileId::ARMED)
             stepEnter(Step::STEP_ALARM_WAIT, nowMs);
         else
@@ -615,7 +686,6 @@ void pipelineTick(uint32_t nowMs)
 
     case Step::STEP_ALARM_WAIT:
     {
-        // Om PIR pending: force comm direkt
         if (g_pir.pending)
         {
             g_nextCommAtMs = nowMs;
@@ -635,7 +705,6 @@ void pipelineTick(uint32_t nowMs)
     }
 
     default:
-        // Fail-safe: om vi hamnar i okänt step, börja om
         stepEnter(Step::STEP_DECIDE, nowMs);
         break;
     }
