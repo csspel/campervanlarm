@@ -1,66 +1,41 @@
-// logging.cpp - RAM + Serial logging (SD disabled)
-//
-// Goal:
-// - No SD_MMC usage at all (it caused instability / errors)
-// - Keep existing logging API so the rest of the project compiles
-// - Provide a small in-RAM ring buffer for recent lines (optional)
-
 #include "logging.h"
-#include "time_manager.h"
-#include "config.h"
 
 #include <Arduino.h>
-
-#ifndef LOG_RING_LINES
-#define LOG_RING_LINES 200
-#endif
-
-static String s_ring[LOG_RING_LINES];
-static uint16_t s_ringHead = 0;
-static uint16_t s_ringCount = 0;
+#include <stdarg.h>
 
 static String makePrefix()
 {
-  struct tm tm;
-  if (getLocalTime(&tm, 0))
+  tm timeInfo{};
+
+  if (getLocalTime(&timeInfo, 0))
   {
     char buf[32];
-    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &timeInfo);
     return String(buf) + " | " + String(millis() / 1000) + "s | ";
   }
 
-  // fallback om tid inte är synkad än
+  // Fallback innan systemtid har synkats
   return String("---- -- -- --:--:-- | ") + String(millis() / 1000) + "s | ";
-}
-
-static void ringPush(const String &line)
-{
-  s_ring[s_ringHead] = line;
-  s_ringHead = (uint16_t)((s_ringHead + 1) % LOG_RING_LINES);
-  if (s_ringCount < LOG_RING_LINES)
-    s_ringCount++;
 }
 
 void loggingInit()
 {
-  // Nothing to init besides a banner.
-  Serial.println("LOG: RAM-only logging (SD disabled)");
+  Serial.println("LOG: Serial-only logging");
 }
 
 void logSystem(const String &msg)
 {
-  String line = makePrefix() + msg;
-  Serial.println(line);
-  ringPush(line);
+  Serial.println(makePrefix() + msg);
 }
 
-// Kept for compatibility. With SD disabled, "flush" is a no-op.
-void loggingFlush(uint32_t /*budgetMs*/, uint16_t /*maxLines*/)
+void logSystemf(const char *fmt, ...)
 {
-  // no-op
-}
+  char buf[160];
 
-void loggingFlushIdle()
-{
-  // no-op
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+
+  logSystem(String(buf));
 }

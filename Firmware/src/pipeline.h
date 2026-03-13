@@ -1,14 +1,18 @@
 #pragma once
-#include <Arduino.h>
-#include "profiles.h"
-#include "gps.h"
 
-// Initieras i setup()
+#include <stdint.h>
+#include "profiles.h"
+
+// Initierar pipeline/state machine.
+// Anropas en gång i setup().
 void pipelineInit();
 
-// Körs ofta i loop()
+// Kör pipeline/state machine.
+// Ska anropas ofta från loop().
 void pipelineTick(uint32_t nowMs);
 
-// Hooks (anropas från mqtt.cpp och profiles.cpp)
+// Hook som anropas när ett PIR-event blivit kvitterat från HA/server.
 void pipelineOnPirAck(uint32_t eventId);
+
+// Hook som anropas när aktiv profil ändras.
 void pipelineOnProfileChanged(ProfileId newProfile);

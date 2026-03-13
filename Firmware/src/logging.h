@@ -1,7 +1,13 @@
 #pragma once
+
 #include <Arduino.h>
 
+// Initierar loggsystemet.
 void loggingInit();
+
+// Loggar ett vanligt textmeddelande.
 void logSystem(const String &msg);
-void loggingFlush(uint32_t budgetMs, uint16_t maxLines);
-void loggingFlushIdle();
+
+// printf-liknande loggfunktion.
+// Exempel: logSystemf("CSQ=%d", csq);
+void logSystemf(const char *fmt, ...);
