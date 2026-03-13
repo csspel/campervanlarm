@@ -1,19 +1,46 @@
 #pragma once
+
 #include <Arduino.h>
 
-enum class TimeSource : uint8_t { NONE=0, MODEM=1, NTP=2 };
+// Anger varifrån systemtiden senast synkades.
+enum class TimeSource : uint8_t
+{
+    NONE = 0,  // Ingen giltig synk ännu
+    MODEM = 1, // Tid hämtad från modemet via AT+CCLK?
+    NTP = 2    // Tid hämtad från NTP över nätet
+};
 
-void timeInit();                                  // set TZ + internal state
-bool timeIsValid();                               // epoch sanity check
-TimeSource timeGetSource();                       // last successful sync source
-uint32_t timeLastSyncEpochUtc();                  // when we last synced (epoch utc)
+// Initierar tidsmodulen:
+// - sätter lokal tidszon till Europe/Stockholm
+// - nollställer intern status för tidskälla/senaste synk
+void timeInit();
 
-// Sync methods
-bool timeSyncFromModem(uint32_t timeoutMs = 1500);           // uses AT+CCLK?
-bool timeSyncFromNtp(uint32_t timeoutMs = 8000);             // SNTP over IP
+// Returnerar true om systemtiden verkar giltig.
+// Används för att upptäcka om klockan fortfarande är "skräptid".
+bool timeIsValid();
 
-// Convenience getters/formatters (require valid time)
-uint32_t timeEpochUtc();                          // now epoch utc (seconds)
-String   timeIsoUtc();                            // "YYYY-MM-DDTHH:MM:SSZ"
-String   timeDateLocal();                         // "YYYY-MM-DD" (Europe/Stockholm)
-String   timeClockLocal();                        // "HH:MM:SS" (Europe/Stockholm)
+// Returnerar vilken källa som senast lyckades synka tiden.
+TimeSource timeGetSource();
+
+// Synka tid från modemet via AT+CCLK?
+// timeoutMs anger hur länge vi väntar på svar från modemet.
+bool timeSyncFromModem(uint32_t timeoutMs = 1500);
+
+// Synka tid från NTP via nätverket.
+// timeoutMs anger hur länge vi väntar på att systemtiden ska bli giltig.
+bool timeSyncFromNtp(uint32_t timeoutMs = 8000);
+
+// Returnerar aktuell systemtid som UTC epoch (sekunder sedan 1970-01-01).
+uint32_t timeEpochUtc();
+
+// Returnerar aktuell tid i UTC-format:
+// "YYYY-MM-DDTHH:MM:SSZ"
+String timeIsoUtc();
+
+// Returnerar lokalt datum enligt svensk tidszon:
+// "YYYY-MM-DD"
+String timeDateLocal();
+
+// Returnerar lokalt klockslag enligt svensk tidszon:
+// "HH:MM:SS"
+String timeClockLocal();

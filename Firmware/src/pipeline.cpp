@@ -1,20 +1,19 @@
 #include "pipeline.h"
 
 #include "config.h"
-#include "gps.h"
+#include "ext_gnss.h"
 #include "logging.h"
 #include "modem.h"
 #include "mqtt.h"
 #include "profiles.h"
 #include "time_manager.h"
 
-// ==============================
-// PIR Outbox (server-ack driven)
-// ==============================
+// ============================================================
+// PIR outbox
+// ============================================================
 struct PirOutbox
 {
     bool pending = false;
-    bool acked = false;
     uint32_t event_id = 0;
     uint16_t count = 0;
     uint32_t first_ms = 0;
@@ -22,39 +21,81 @@ struct PirOutbox
     uint8_t src_mask = 0; // bit0=front, bit1=back
 };
 
-// ---- Lockout: max 1 MQTT/min per PIR ----
-static uint32_t g_pirIgnoreFrontUntilMs = 0;
-static uint32_t g_pirIgnoreBackUntilMs = 0;
-static const uint32_t PIR_LOCKOUT_MS = 60UL * 1000UL;
-
-// ---- Filter: max 1 accepted trigger/s per PIR (för logg + vidare bearbetning) ----
-static uint32_t g_lastPirAcceptedFrontMs = 0;
-static uint32_t g_lastPirAcceptedBackMs = 0;
-static const uint32_t PIR_ACCEPT_MIN_GAP_MS = 1000UL; // 1 Hz
-
 static PirOutbox g_pir;
 
-static volatile uint16_t g_pirIsrCount = 0;
-static volatile uint8_t g_pirIsrMask = 0; // bit0=front, bit1=back
+// ============================================================
+// PIR filter / lockout
+// ============================================================
+static uint32_t g_lastPirAcceptedFrontMs = 0;
+static uint32_t g_lastPirAcceptedBackMs = 0;
+static const uint32_t PIR_ACCEPT_MIN_GAP_MS = 1000UL;
 
-static uint32_t g_nextEventId = 1;      // TODO: persist i NVS senare
-static bool g_alarmGpsSkipUsed = false; // skip GPS EN gång per ARMED-episod
-
-// ---- ARMED_AWAKE window (30 min sliding, max 2 h) ----
-static uint32_t g_armedAwakeStartMs = 0;
-static uint32_t g_armedAwakeUntilMs = 0; // senaste "vaken till"
-static bool g_armedAwakeActive = false;
-
-static const uint32_t ARMED_AWAKE_WINDOW_MS = 30UL * 60UL * 1000UL;    // 30 min
-static const uint32_t ARMED_AWAKE_MAX_MS = 2UL * 60UL * 60UL * 1000UL; // 2 h
-static const uint32_t ARMED_AWAKE_COMM_MS = 2UL * 60UL * 1000UL;       // alive var 2 min
-static uint32_t g_nextAwakeAliveAtMs = 0;
-
-// ---- Publish-rate limiter: max 1/min per PIR ----
 static uint32_t g_lastPirPublishFrontMs = 0;
 static uint32_t g_lastPirPublishBackMs = 0;
 static const uint32_t PIR_THROTTLE_MS = 60UL * 1000UL;
 
+static uint32_t g_pirIgnoreFrontUntilMs = 0;
+static uint32_t g_pirIgnoreBackUntilMs = 0;
+static const uint32_t PIR_LOCKOUT_MS = 60UL * 1000UL;
+
+// ============================================================
+// PIR ISR-state
+// ============================================================
+static volatile uint16_t g_pirIsrCount = 0;
+static volatile uint8_t g_pirIsrMask = 0; // bit0=front, bit1=back
+
+// ============================================================
+// Övrigt state
+// ============================================================
+static uint32_t g_nextEventId = 1;
+static uint32_t g_nextCommAtMs = 0;
+
+// När TRIGGERED ska återgå till ARMED.
+static uint32_t g_triggeredUntilMs = 0;
+
+// ------------------------------------------------------------
+// Boot-profile-sync state
+// ------------------------------------------------------------
+// När vi precis kopplat upp MQTT efter boot/reconnect vill vi ge
+// retained desired profile en chans att komma in innan vi kör första
+// publish-cykeln och ev. kopplar ner igen.
+//
+// g_bootProfileSyncActive:
+//   true under det korta sync-fönstret efter MQTT connect.
+//
+// Detta används också i pipelineOnProfileChanged() för att undvika
+// att en profil som inte är keepConnected direkt orsakar disconnect
+// innan första publish hunnit ske.
+// ------------------------------------------------------------
+static bool g_bootProfileSyncActive = false;
+
+// ============================================================
+// Pipeline state machine
+// ============================================================
+enum class Step
+{
+    STEP_DECIDE = 0,
+    STEP_NET_ATTACH,
+    STEP_MQTT_CONNECT,
+
+    // Nytt steg:
+    // vänta kort på retained desired_profile efter connect.
+    STEP_BOOT_PROFILE_SYNC,
+
+    STEP_PUBLISH,
+    STEP_RX_DOWNLINK,
+    STEP_CONNECTED_WAIT,
+    STEP_MQTT_DISCONNECT,
+    STEP_RF_OFF,
+    STEP_IDLE_WAIT
+};
+
+static Step g_step = Step::STEP_DECIDE;
+static uint32_t g_deadlineMs = 0;
+
+// ============================================================
+// ISR handlers
+// ============================================================
 static void IRAM_ATTR isrPirFront()
 {
     g_pirIsrCount++;
@@ -67,32 +108,187 @@ static void IRAM_ATTR isrPirBack()
     g_pirIsrMask |= 0x02;
 }
 
-// ---------- helpers ----------
+// ============================================================
+// Helpers
+// ============================================================
+
+// Robust tidsjämförelse för millis() med wraparound-stöd.
+static inline bool timeReached(uint32_t nowMs, uint32_t targetMs)
+{
+    return (int32_t)(nowMs - targetMs) >= 0;
+}
+
+// Returnerar true om nowMs ligger före untilMs.
 static inline bool isBefore(uint32_t nowMs, uint32_t untilMs)
 {
     return (int32_t)(nowMs - untilMs) < 0;
 }
 
-static void pirStartOrExtendAwake(uint32_t nowMs)
+// Returnerar true om aktuell profil har någon PIR aktiv.
+static bool currentProfileUsesPir()
 {
-    if (!g_armedAwakeActive)
+    const auto &p = currentProfile();
+    return p.pirFront || p.pirBack;
+}
+
+// Returnerar true om systemet i detta ögonblick ska hålla RF/data/MQTT uppe.
+static bool shouldKeepConnectedNow()
+{
+    return currentProfile().keepConnected;
+}
+
+// Nollställ PIR-outbox.
+static void pirClearOutbox()
+{
+    g_pir.pending = false;
+    g_pir.event_id = 0;
+    g_pir.count = 0;
+    g_pir.first_ms = 0;
+    g_pir.last_ms = 0;
+    g_pir.src_mask = 0;
+}
+
+// Förläng timeouten för TRIGGERED.
+static void triggeredExtendTimeout(uint32_t nowMs)
+{
+    if (currentProfile().id != ProfileId::TRIGGERED)
+        return;
+
+    if (currentProfile().autoReturnMs == 0)
+        return;
+
+    g_triggeredUntilMs = nowMs + currentProfile().autoReturnMs;
+}
+
+// Returnerar true om pending PIR får publiceras just nu.
+static bool pirCanPublishNow(uint32_t nowMs)
+{
+    if (!g_pir.pending)
+        return false;
+
+    bool allow = false;
+
+    if (g_pir.src_mask & 0x01)
     {
-        g_armedAwakeActive = true;
-        g_armedAwakeStartMs = nowMs;
-        g_armedAwakeUntilMs = nowMs + ARMED_AWAKE_WINDOW_MS;
-        g_nextAwakeAliveAtMs = nowMs;
+        if (g_lastPirPublishFrontMs == 0 ||
+            (int32_t)(nowMs - g_lastPirPublishFrontMs) >= (int32_t)PIR_THROTTLE_MS)
+        {
+            allow = true;
+        }
     }
-    else
+
+    if (g_pir.src_mask & 0x02)
     {
-        uint32_t proposed = nowMs + ARMED_AWAKE_WINDOW_MS;
-        uint32_t cap = g_armedAwakeStartMs + ARMED_AWAKE_MAX_MS;
-        g_armedAwakeUntilMs = (proposed < cap) ? proposed : cap;
+        if (g_lastPirPublishBackMs == 0 ||
+            (int32_t)(nowMs - g_lastPirPublishBackMs) >= (int32_t)PIR_THROTTLE_MS)
+        {
+            allow = true;
+        }
+    }
+
+    return allow;
+}
+
+// Markera att PIR har publicerats och sätt lockout.
+static void pirMarkPublishedAndLockout(uint32_t nowMs)
+{
+    if (!g_pir.pending)
+        return;
+
+    if (g_pir.src_mask & 0x01)
+    {
+        g_lastPirPublishFrontMs = nowMs;
+        g_pirIgnoreFrontUntilMs = nowMs + PIR_LOCKOUT_MS;
+    }
+
+    if (g_pir.src_mask & 0x02)
+    {
+        g_lastPirPublishBackMs = nowMs;
+        g_pirIgnoreBackUntilMs = nowMs + PIR_LOCKOUT_MS;
     }
 }
 
-// ==============================
-// PIR ingest (ISR -> filtered -> lockout -> outbox)
-// ==============================
+// Bygg en ExtGnssFix från senaste externa GNSS-fix.
+// Returnerar true om giltig extern fix fanns.
+static bool buildGpsFromExternal(ExtGnssFix &out)
+{
+    out = ExtGnssFix{};
+
+#if EXTERNAL_GNSS_ENABLED
+    return extGnssGetLatest(out);
+#else
+    return false;
+#endif
+}
+
+// Gå in i nytt step och sätt eventuell timeout/omedelbar åtgärd.
+static void stepEnter(Step s, uint32_t nowMs)
+{
+    g_step = s;
+
+    switch (s)
+    {
+    case Step::STEP_DECIDE:
+        break;
+
+    case Step::STEP_NET_ATTACH:
+        g_deadlineMs = nowMs + 60000UL;
+        break;
+
+    case Step::STEP_MQTT_CONNECT:
+        g_deadlineMs = nowMs + 15000UL;
+        break;
+
+    case Step::STEP_BOOT_PROFILE_SYNC:
+        // Precis efter connect ger vi retained desired profile
+        // en kort chans att spelas upp innan första publish.
+        g_bootProfileSyncActive = true;
+        g_deadlineMs = nowMs + MQTT_BOOT_PROFILE_SYNC_WINDOW_MS;
+        break;
+
+    case Step::STEP_PUBLISH:
+        // Så fort vi ska publicera är boot-sync-fönstret över.
+        g_bootProfileSyncActive = false;
+        g_deadlineMs = nowMs + 8000UL;
+        break;
+
+    case Step::STEP_RX_DOWNLINK:
+        g_deadlineMs = nowMs + 5000UL;
+        break;
+
+    case Step::STEP_CONNECTED_WAIT:
+        g_bootProfileSyncActive = false;
+        g_deadlineMs = 0;
+        break;
+
+    case Step::STEP_MQTT_DISCONNECT:
+        g_bootProfileSyncActive = false;
+        mqttDisconnect();
+        g_deadlineMs = nowMs + 500UL;
+        break;
+
+    case Step::STEP_RF_OFF:
+        g_bootProfileSyncActive = false;
+        modemRfOff();
+        g_deadlineMs = nowMs + 500UL;
+        break;
+
+    case Step::STEP_IDLE_WAIT:
+        g_bootProfileSyncActive = false;
+        g_deadlineMs = g_nextCommAtMs;
+        break;
+    }
+}
+
+// Kontroll om aktuellt step nått deadline.
+static bool stepTimedOut(uint32_t nowMs)
+{
+    return timeReached(nowMs, g_deadlineMs);
+}
+
+// ============================================================
+// PIR ingest
+// ============================================================
 static void pirIngestIsr(uint32_t nowMs)
 {
     uint16_t n;
@@ -105,14 +301,22 @@ static void pirIngestIsr(uint32_t nowMs)
     g_pirIsrMask = 0;
     interrupts();
 
-    const auto &p = currentProfile();
-    if (p.id != ProfileId::ARMED)
-        return;
-
     if (n == 0 || mask == 0)
         return;
 
-    // ---- Step 1: Lockout filter (ignorera helt under lockout) ----
+    if (!currentProfileUsesPir())
+        return;
+
+    const auto &p = currentProfile();
+
+    if (!p.pirFront)
+        mask &= ~0x01;
+    if (!p.pirBack)
+        mask &= ~0x02;
+
+    if (mask == 0)
+        return;
+
     uint8_t lockoutFiltered = mask;
 
     if ((lockoutFiltered & 0x01) && isBefore(nowMs, g_pirIgnoreFrontUntilMs))
@@ -122,16 +326,10 @@ static void pirIngestIsr(uint32_t nowMs)
         lockoutFiltered &= ~0x02;
 
     if (lockoutFiltered == 0)
-    {
-        // Allt låg i lockout -> ignorera tyst (eller logga vid behov)
-        // logSystemf("PIR: LOCKOUT (ignored) mask=0x%02X", (unsigned)mask);
         return;
-    }
 
-    // ---- Step 2: 1 Hz accept per PIR (för att inte spamma logg & outbox) ----
     uint8_t acceptedMask = 0;
 
-    // FRONT
     if (lockoutFiltered & 0x01)
     {
         if (g_lastPirAcceptedFrontMs == 0 ||
@@ -142,7 +340,6 @@ static void pirIngestIsr(uint32_t nowMs)
         }
     }
 
-    // BACK
     if (lockoutFiltered & 0x02)
     {
         if (g_lastPirAcceptedBackMs == 0 ||
@@ -155,9 +352,8 @@ static void pirIngestIsr(uint32_t nowMs)
 
     if (acceptedMask == 0)
     {
-        // Triggers kom, men vi tar max 1/s -> ignoreras
-        // Logga sparsamt: här loggar vi varje gång vi *har ISR-data* men inget accepteras
-        logSystemf("PIR: FILTERED (rate-limit 1Hz) raw_n=%u raw_mask=0x%02X", (unsigned)n, (unsigned)mask);
+        logSystemf("PIR: FILTERED (1Hz) raw_n=%u raw_mask=0x%02X",
+                   (unsigned)n, (unsigned)mask);
         return;
     }
 
@@ -166,15 +362,12 @@ static void pirIngestIsr(uint32_t nowMs)
                         : (acceptedMask == 0x03) ? "FRONT+BACK"
                                                  : "UNKNOWN";
 
-    // Detta är de triggers som “kommer vidare” (max 1/s per PIR) och syns i loggen
-    logSystemf("PIR: FILTERED (accepted) which=%s raw_n=%u raw_mask=0x%02X accepted_mask=0x%02X",
+    logSystemf("PIR: ACCEPTED which=%s raw_n=%u raw_mask=0x%02X accepted_mask=0x%02X",
                which, (unsigned)n, (unsigned)mask, (unsigned)acceptedMask);
 
-    // ---- Step 3: Lägg i outbox (men queue:a inte för senare throttle; vi använder lockout för det) ----
     if (!g_pir.pending)
     {
         g_pir.pending = true;
-        g_pir.acked = false;
         g_pir.event_id = g_nextEventId++;
         g_pir.count = 0;
         g_pir.first_ms = nowMs;
@@ -182,8 +375,6 @@ static void pirIngestIsr(uint32_t nowMs)
         g_pir.src_mask = 0;
     }
 
-    // Vi räknar 1 per accepterad “sekund-tick” per sensor (inte raw_n)
-    // så count blir “antal sekunder med rörelse” ungefär, inte brus.
     uint16_t add = 0;
     if (acceptedMask & 0x01)
         add++;
@@ -194,515 +385,404 @@ static void pirIngestIsr(uint32_t nowMs)
     g_pir.last_ms = nowMs;
     g_pir.src_mask |= acceptedMask;
 
-    // Starta / förläng ARMED_AWAKE
-    pirStartOrExtendAwake(nowMs);
-}
-
-// ==============================
-// Pipeline state machine
-// ==============================
-enum class Step
-{
-    STEP_DECIDE = 0,
-    STEP_GPS_ON,
-    STEP_GPS_WARMUP,
-    STEP_GPS_COLLECT,
-    STEP_GPS_OFF,
-    STEP_RF_ON,
-    STEP_NET_ATTACH,
-    STEP_MQTT_CONNECT,
-    STEP_PUBLISH,
-    STEP_RX_DOWNLINK,
-    STEP_MQTT_DISCONNECT,
-    STEP_RF_OFF,
-    STEP_ALARM_WAIT,
-    STEP_PARKED_WAIT
-};
-
-static Step g_step = Step::STEP_DECIDE;
-static uint32_t g_stepEnterMs = 0;
-static uint32_t g_deadlineMs = 0;
-static uint32_t g_nextCommAtMs = 0;
-static bool g_needComm = false;
-
-// GPS result for this cycle
-static bool g_gpsHave = false;
-static bool g_gpsFixOk = false;
-static GpsFix g_gpsFix;
-
-enum class GpsPlan
-{
-    NONE = 0,
-    SINGLE
-};
-static GpsPlan g_gpsPlan = GpsPlan::NONE;
-static uint32_t g_gpsCollectTimeoutMs = 0;
-
-// non-blocking GPS poll control
-static uint32_t g_gpsNextPollMs = 0;
-static uint32_t g_gpsPollIntervalMs = 1000UL; // adaptiv: snabbare när vi har kandidat
-
-static void stepEnter(Step s, uint32_t nowMs)
-{
-    g_step = s;
-    g_stepEnterMs = nowMs;
-
-    switch (s)
+    if (p.id == ProfileId::ARMED)
     {
-    case Step::STEP_DECIDE:
-        break;
-
-    case Step::STEP_GPS_ON:
-        modemRfOff(); // GNSS <-> LTE mux: RF OFF innan GPS
-        gpsPowerOn();
-        g_deadlineMs = nowMs + 2000UL;
-        break;
-
-    case Step::STEP_GPS_WARMUP:
-        g_deadlineMs = nowMs + 1500UL;
-        break;
-
-    case Step::STEP_GPS_COLLECT:
-        g_deadlineMs = nowMs + g_gpsCollectTimeoutMs;
-        g_gpsNextPollMs = nowMs;
-        g_gpsPollIntervalMs = 1000UL;
-        break;
-
-    case Step::STEP_GPS_OFF:
-        gpsPowerOff();
-        g_deadlineMs = nowMs + 200UL;
-        break;
-
-    case Step::STEP_RF_ON:
-        gpsPowerOff();
-        g_deadlineMs = nowMs + 200UL;
-        break;
-
-    case Step::STEP_NET_ATTACH:
-        g_deadlineMs = nowMs + 60000UL;
-        break;
-
-    case Step::STEP_MQTT_CONNECT:
-        g_deadlineMs = nowMs + 15000UL;
-        break;
-
-    case Step::STEP_PUBLISH:
-        g_deadlineMs = nowMs + 8000UL;
-        break;
-
-    case Step::STEP_RX_DOWNLINK:
-        if (currentProfile().id == ProfileId::ARMED && g_armedAwakeActive)
-        {
-            g_deadlineMs = g_armedAwakeUntilMs;
-        }
-        else
-        {
-            g_deadlineMs = nowMs + (g_pir.pending ? 30000UL : 5000UL);
-        }
-        break;
-
-    case Step::STEP_MQTT_DISCONNECT:
-        mqttDisconnect();
-        g_deadlineMs = nowMs + 500UL;
-        break;
-
-    case Step::STEP_RF_OFF:
-        modemRfOff();
-        g_deadlineMs = nowMs + 500UL;
-        break;
-
-    case Step::STEP_ALARM_WAIT:
-    case Step::STEP_PARKED_WAIT:
-        g_deadlineMs = g_nextCommAtMs;
-        break;
+        logSystem("PIR: auto profile change ARMED -> TRIGGERED");
+        setProfile(ProfileId::TRIGGERED);
+        triggeredExtendTimeout(nowMs);
+    }
+    else if (p.id == ProfileId::TRIGGERED)
+    {
+        triggeredExtendTimeout(nowMs);
     }
 }
 
-static bool stepTimedOut(uint32_t nowMs)
-{
-    return (int32_t)(nowMs - g_deadlineMs) >= 0;
-}
-
-// ------------------------------
-// Helpers: PIR publish eligibility (per PIR, 1/min)
-// ------------------------------
-static bool pirCanPublishNow(uint32_t nowMs)
-{
-    if (!g_pir.pending)
-        return false;
-
-    bool allow = false;
-
-    if (g_pir.src_mask & 0x01)
-    {
-        if (g_lastPirPublishFrontMs == 0 ||
-            (int32_t)(nowMs - g_lastPirPublishFrontMs) >= (int32_t)PIR_THROTTLE_MS)
-            allow = true;
-    }
-
-    if (g_pir.src_mask & 0x02)
-    {
-        if (g_lastPirPublishBackMs == 0 ||
-            (int32_t)(nowMs - g_lastPirPublishBackMs) >= (int32_t)PIR_THROTTLE_MS)
-            allow = true;
-    }
-
-    return allow;
-}
-
-static void pirMarkPublishedAndLockout(uint32_t nowMs)
-{
-    if (!g_pir.pending)
-        return;
-
-    // FRONT
-    if (g_pir.src_mask & 0x01)
-    {
-        g_lastPirPublishFrontMs = nowMs;
-        g_pirIgnoreFrontUntilMs = nowMs + PIR_LOCKOUT_MS;
-    }
-
-    // BACK
-    if (g_pir.src_mask & 0x02)
-    {
-        g_lastPirPublishBackMs = nowMs;
-        g_pirIgnoreBackUntilMs = nowMs + PIR_LOCKOUT_MS;
-    }
-}
-
-// ==============================
+// ============================================================
 // Hooks från andra moduler
-// ==============================
+// ============================================================
 void pipelineOnPirAck(uint32_t eventId)
 {
     if (g_pir.pending && g_pir.event_id == eventId)
     {
         logSystemf("PIR: ACK -> clear outbox event_id=%u", (unsigned)eventId);
-
-        // Clear direkt (även i ARMED_AWAKE där vi inte går via RF_OFF)
-        g_pir.pending = false;
-        g_pir.acked = false;
-        g_pir.count = 0;
-        g_pir.first_ms = 0;
-        g_pir.last_ms = 0;
-        g_pir.src_mask = 0;
+        pirClearOutbox();
     }
 }
 
+// Anropas när profil ändras.
 void pipelineOnProfileChanged(ProfileId newProfile)
 {
-    g_alarmGpsSkipUsed = false;
-    (void)newProfile;
+    uint32_t nowMs = millis();
 
-    if (newProfile != ProfileId::ARMED)
+    // --------------------------------------------------------
+    // TRIGGERED: sätt timeout för auto-return till ARMED
+    // --------------------------------------------------------
+    if (newProfile == ProfileId::TRIGGERED)
     {
-        g_armedAwakeActive = false;
-        g_armedAwakeStartMs = 0;
-        g_armedAwakeUntilMs = 0;
+        if (currentProfile().autoReturnMs > 0)
+        {
+            g_triggeredUntilMs = nowMs + currentProfile().autoReturnMs;
+        }
+        else
+        {
+            g_triggeredUntilMs = 0;
+        }
+    }
+    else
+    {
+        g_triggeredUntilMs = 0;
+    }
 
-        g_pir.pending = false;
-        g_pir.acked = false;
-        g_pir.count = 0;
-        g_pir.src_mask = 0;
-
-        // nollställ accept-filter också
+    // --------------------------------------------------------
+    // När vi lämnar PIR-familjen helt kan vi rensa PIR-state.
+    // --------------------------------------------------------
+    if (newProfile == ProfileId::PARKED || newProfile == ProfileId::TRAVEL)
+    {
+        pirClearOutbox();
         g_lastPirAcceptedFrontMs = 0;
         g_lastPirAcceptedBackMs = 0;
     }
+
+    // --------------------------------------------------------
+    // Planera om nästa ordinarie kommunikationsfönster enligt
+    // nya profilen.
+    // --------------------------------------------------------
+    g_nextCommAtMs = nowMs + currentProfile().commIntervalMs;
+
+    // --------------------------------------------------------
+    // Specialfall:
+    // Om profil ändras medan vi fortfarande är i första sync-fönstret
+    // efter MQTT connect, ska vi INTE gå direkt till disconnect bara
+    // för att den nya profilen inte är keepConnected.
+    //
+    // I stället går vi till publish så att första publiceringen sker
+    // med rätt profil.
+    // --------------------------------------------------------
+    if (g_bootProfileSyncActive && mqttIsConnected())
+    {
+        logSystem("PIPELINE: profile changed during boot sync -> publish with new profile");
+        stepEnter(Step::STEP_PUBLISH, nowMs);
+        return;
+    }
+
+    // --------------------------------------------------------
+    // Normal styrning av state machine efter profilbyte.
+    // --------------------------------------------------------
+    if (shouldKeepConnectedNow() && mqttIsConnected())
+    {
+        stepEnter(Step::STEP_CONNECTED_WAIT, nowMs);
+    }
+    else if (!shouldKeepConnectedNow() && mqttIsConnected())
+    {
+        stepEnter(Step::STEP_MQTT_DISCONNECT, nowMs);
+    }
+    else
+    {
+        stepEnter(Step::STEP_DECIDE, nowMs);
+    }
 }
 
-// ==============================
-// Init + tick
-// ==============================
+// ============================================================
+// Init
+// ============================================================
 void pipelineInit()
 {
-    modemRfOff();
-    gpsPowerOff();
+#if EXTERNAL_GNSS_ENABLED
+    extGnssBegin(PIN_GNSS_RX, PIN_GNSS_TX, GNSS_BAUD);
+    logSystem("GPS: using external GNSS (UART)");
+#endif
 
+    // Första kommunikationsförsök en liten stund efter boot
     g_nextCommAtMs = millis() + 2000UL;
 
+    // Om defaultprofil inte ska hålla anslutning uppe:
+    // stäng RF direkt initialt.
+    if (!shouldKeepConnectedNow())
+    {
+        modemRfOff();
+    }
+
+    // PIR-ingångar
     pinMode(PIN_PIR_FRONT, INPUT_PULLDOWN);
     pinMode(PIN_PIR_BACK, INPUT_PULLDOWN);
+
     attachInterrupt(digitalPinToInterrupt(PIN_PIR_FRONT), isrPirFront, RISING);
     attachInterrupt(digitalPinToInterrupt(PIN_PIR_BACK), isrPirBack, RISING);
 
     stepEnter(Step::STEP_DECIDE, millis());
 }
 
+// ============================================================
+// Huvudtick
+// ============================================================
 void pipelineTick(uint32_t nowMs)
 {
-    // Ingest PIR varje tick (oavsett step)
+#if EXTERNAL_GNSS_ENABLED
+    // Poll extern GNSS kontinuerligt så senaste fix hålls uppdaterad
+    extGnssPoll();
+#endif
+
+    // Hämta in PIR-data från ISR varje tick
     pirIngestIsr(nowMs);
+
+    // Automatisk TRIGGERED -> ARMED när timeout går ut
+    if (currentProfile().id == ProfileId::TRIGGERED &&
+        currentProfile().autoReturnMs > 0 &&
+        g_triggeredUntilMs > 0 &&
+        timeReached(nowMs, g_triggeredUntilMs))
+    {
+        logSystem("PROFILE: auto return TRIGGERED -> ARMED");
+        setProfile(ProfileId::ARMED);
+    }
 
     switch (g_step)
     {
     case Step::STEP_DECIDE:
     {
-        const auto &p = currentProfile();
+        bool commDue = timeReached(nowMs, g_nextCommAtMs);
+        bool needComm = g_pir.pending || commDue;
 
-        if (g_armedAwakeActive && (int32_t)(nowMs - g_armedAwakeUntilMs) >= 0)
-            g_armedAwakeActive = false;
-
-        bool commDue = ((int32_t)(nowMs - g_nextCommAtMs) >= 0);
-        g_needComm = g_pir.pending || commDue;
-
-        // Reset per cycle gps result
-        g_gpsHave = false;
-        g_gpsFixOk = false;
-        g_gpsFix = GpsFix{};
-
-        // GPS-plan
-        g_gpsPlan = GpsPlan::NONE;
-        g_gpsCollectTimeoutMs = 0;
-
-        if (g_needComm)
+        if (needComm)
         {
-            if (p.id == ProfileId::ARMED)
+            if (mqttIsConnected())
             {
-                if (g_pir.pending && !g_alarmGpsSkipUsed)
-                {
-                    g_gpsPlan = GpsPlan::NONE;
-                    g_alarmGpsSkipUsed = true;
-                }
-                else
-                {
-                    g_gpsPlan = (p.gpsFixWaitMs > 0) ? GpsPlan::SINGLE : GpsPlan::NONE;
-                    if (p.gpsFixWaitMs > 0)
-                        g_gpsCollectTimeoutMs = p.gpsFixWaitMs;
-                }
+                stepEnter(Step::STEP_PUBLISH, nowMs);
             }
             else
             {
-                g_gpsPlan = (p.gpsFixWaitMs > 0) ? GpsPlan::SINGLE : GpsPlan::NONE;
-                if (p.gpsFixWaitMs > 0)
-                    g_gpsCollectTimeoutMs = p.gpsFixWaitMs;
+                stepEnter(Step::STEP_NET_ATTACH, nowMs);
             }
-        }
-
-        if (!g_needComm)
-        {
-            if (p.id == ProfileId::ARMED)
-                stepEnter(Step::STEP_ALARM_WAIT, nowMs);
-            else
-                stepEnter(Step::STEP_PARKED_WAIT, nowMs);
             break;
         }
 
-        if (g_gpsPlan != GpsPlan::NONE)
-            stepEnter(Step::STEP_GPS_ON, nowMs);
+        if (shouldKeepConnectedNow() && mqttIsConnected())
+        {
+            stepEnter(Step::STEP_CONNECTED_WAIT, nowMs);
+        }
+        else if (!shouldKeepConnectedNow() && mqttIsConnected())
+        {
+            stepEnter(Step::STEP_MQTT_DISCONNECT, nowMs);
+        }
+        else if (!shouldKeepConnectedNow())
+        {
+            stepEnter(Step::STEP_IDLE_WAIT, nowMs);
+        }
         else
-            stepEnter(Step::STEP_RF_ON, nowMs);
+        {
+            stepEnter(Step::STEP_IDLE_WAIT, nowMs);
+        }
 
         break;
     }
-
-    // ---------------- GPS ----------------
-    case Step::STEP_GPS_ON:
-        stepEnter(Step::STEP_GPS_WARMUP, nowMs);
-        break;
-
-    case Step::STEP_GPS_WARMUP:
-        if (stepTimedOut(nowMs))
-            stepEnter(Step::STEP_GPS_COLLECT, nowMs);
-        break;
-
-    case Step::STEP_GPS_COLLECT:
-    {
-        if ((int32_t)(nowMs - g_gpsNextPollMs) >= 0)
-        {
-            g_gpsNextPollMs = nowMs + g_gpsPollIntervalMs;
-
-            GpsFix fx;
-            bool ok = gpsPollOnce(fx);
-            if (ok)
-            {
-                if (fx.candidate && !fx.valid)
-                    g_gpsPollIntervalMs = 500UL;
-
-                if (fx.valid)
-                {
-                    g_gpsFix = fx;
-                    g_gpsFixOk = true;
-                    g_gpsHave = true;
-                    stepEnter(Step::STEP_GPS_OFF, nowMs);
-                    break;
-                }
-            }
-        }
-
-        if (stepTimedOut(nowMs))
-        {
-            g_gpsHave = false;
-            g_gpsFixOk = false;
-            logSystem("GPS: timeout (no valid fix)");
-            stepEnter(Step::STEP_GPS_OFF, nowMs);
-        }
-        break;
-    }
-
-    case Step::STEP_GPS_OFF:
-        stepEnter(Step::STEP_RF_ON, nowMs);
-        break;
-
-    // ---------------- RF + NET + MQTT ----------------
-    case Step::STEP_RF_ON:
-        stepEnter(Step::STEP_NET_ATTACH, nowMs);
-        break;
 
     case Step::STEP_NET_ATTACH:
     {
+        // OBS: modemConnectData() är fortfarande blockerande.
         NetResult net;
         bool ok = modemConnectData(APN, NET_REG_TIMEOUT_MS, DATA_ATTACH_TIMEOUT_MS, net);
+
         if (ok)
         {
+            // Försök först tid från modemet, sedan NTP
             timeSyncFromModem();
             timeSyncFromNtp(8000);
+
             stepEnter(Step::STEP_MQTT_CONNECT, nowMs);
             break;
         }
 
-        if (stepTimedOut(nowMs))
+        // Misslyckad attach -> försök igen nästa intervall
+        g_nextCommAtMs = nowMs + currentProfile().commIntervalMs;
+
+        if (shouldKeepConnectedNow())
         {
-            const auto &p = currentProfile();
-            g_nextCommAtMs = nowMs + p.commIntervalMs;
+            stepEnter(Step::STEP_IDLE_WAIT, nowMs);
+        }
+        else
+        {
             stepEnter(Step::STEP_RF_OFF, nowMs);
         }
+
         break;
     }
 
     case Step::STEP_MQTT_CONNECT:
         if (mqttConnect())
         {
+            // Viktigt:
+            // efter connect går vi INTE direkt till publish,
+            // utan ger retained desired_profile en chans först.
+            stepEnter(Step::STEP_BOOT_PROFILE_SYNC, nowMs);
+            break;
+        }
+
+        if (stepTimedOut(nowMs))
+        {
+            g_nextCommAtMs = nowMs + currentProfile().commIntervalMs;
+
+            if (shouldKeepConnectedNow())
+            {
+                stepEnter(Step::STEP_IDLE_WAIT, nowMs);
+            }
+            else
+            {
+                stepEnter(Step::STEP_MQTT_DISCONNECT, nowMs);
+            }
+        }
+        break;
+
+    case Step::STEP_BOOT_PROFILE_SYNC:
+        // Under detta korta fönster kör vi mqttLoop så att retained
+        // desired_profile faktiskt hinner processas av callbacken.
+        mqttLoop();
+
+        // Om retained profil redan hunnit komma kan vi gå vidare direkt.
+        if (mqttHasSeenDesiredProfileThisConnect())
+        {
+            logSystem("PIPELINE: desired profile received during boot sync");
             stepEnter(Step::STEP_PUBLISH, nowMs);
             break;
         }
+
+        // Om inget kom inom sync-fönstret fortsätter vi ändå.
+        // Då publicerar vi med nuvarande profil.
         if (stepTimedOut(nowMs))
         {
-            const auto &p = currentProfile();
-            g_nextCommAtMs = nowMs + p.commIntervalMs;
-            stepEnter(Step::STEP_MQTT_DISCONNECT, nowMs);
+            logSystem("PIPELINE: boot profile sync timeout -> continue");
+            stepEnter(Step::STEP_PUBLISH, nowMs);
         }
         break;
 
     case Step::STEP_PUBLISH:
     {
-        if (g_gpsHave)
-            mqttPublishGpsSingle(g_gpsFix, g_gpsFixOk);
+        ExtGnssFix fx;
+        bool fixOk = buildGpsFromExternal(fx);
 
-        // PIR: publish om tillåtet just nu, annars DROPPAR vi (lockout-mode, ingen kö)
+        // Skicka alltid GPS-single; fixOk anger om positionen är giltig
+        mqttPublishGpsSingle(fx, fixOk);
+
         if (g_pir.pending)
         {
             if (pirCanPublishNow(nowMs))
             {
                 pirMarkPublishedAndLockout(nowMs);
-                mqttPublishPirEvent(g_pir.event_id, g_pir.count, g_pir.first_ms, g_pir.last_ms, g_pir.src_mask);
+                mqttPublishPirEvent(g_pir.event_id,
+                                    g_pir.count,
+                                    g_pir.first_ms,
+                                    g_pir.last_ms,
+                                    g_pir.src_mask);
             }
             else
             {
-                // Viktigt: INGEN “queue till nästa minut”
-                logSystem("PIR: blocked by 1/min rule -> drop (lockout mode, no queue)");
-                g_pir.pending = false;
-                g_pir.acked = false;
-                g_pir.count = 0;
-                g_pir.first_ms = 0;
-                g_pir.last_ms = 0;
-                g_pir.src_mask = 0;
+                logSystem("PIR: blocked by 1/min rule -> drop");
+                pirClearOutbox();
             }
         }
 
         mqttPublishAlive();
 
-        stepEnter(Step::STEP_RX_DOWNLINK, nowMs);
+        // Planera nästa ordinarie kommunikation
+        g_nextCommAtMs = nowMs + currentProfile().commIntervalMs;
+
+        if (shouldKeepConnectedNow())
+        {
+            stepEnter(Step::STEP_CONNECTED_WAIT, nowMs);
+        }
+        else
+        {
+            // Ge en kort stund för extra downlink efter publish
+            stepEnter(Step::STEP_RX_DOWNLINK, nowMs);
+        }
+
         break;
     }
 
     case Step::STEP_RX_DOWNLINK:
-    {
         mqttLoop();
 
-        if (currentProfile().id == ProfileId::ARMED && g_armedAwakeActive)
+        if (stepTimedOut(nowMs))
         {
-            // Ny PIR pending under RX: om 1/min-regeln tillåter, publicera direkt.
-            // Om inte tillåter => droppa direkt så den inte “skjuts upp”.
-            if (g_pir.pending)
+            if (shouldKeepConnectedNow())
             {
-                if (pirCanPublishNow(nowMs))
-                {
-                    stepEnter(Step::STEP_PUBLISH, nowMs);
-                    break;
-                }
-                else
-                {
-                    logSystem("PIR: pending during RX but blocked by 1/min -> drop");
-                    g_pir.pending = false;
-                    g_pir.acked = false;
-                    g_pir.count = 0;
-                    g_pir.first_ms = 0;
-                    g_pir.last_ms = 0;
-                    g_pir.src_mask = 0;
-                }
+                stepEnter(Step::STEP_CONNECTED_WAIT, nowMs);
             }
-
-            // Periodisk alive (2 min)
-            if ((int32_t)(nowMs - g_nextAwakeAliveAtMs) >= 0)
+            else
             {
-                mqttPublishAlive();
-                g_nextAwakeAliveAtMs = nowMs + ARMED_AWAKE_COMM_MS;
-            }
-
-            if ((int32_t)(nowMs - g_armedAwakeUntilMs) >= 0)
-            {
-                g_armedAwakeActive = false;
                 stepEnter(Step::STEP_MQTT_DISCONNECT, nowMs);
             }
+        }
+        break;
+
+    case Step::STEP_CONNECTED_WAIT:
+        if (!mqttIsConnected())
+        {
+            stepEnter(Step::STEP_DECIDE, nowMs);
             break;
         }
 
-        if (stepTimedOut(nowMs))
+        mqttLoop();
+
+        if (g_pir.pending && pirCanPublishNow(nowMs))
+        {
+            stepEnter(Step::STEP_PUBLISH, nowMs);
+            break;
+        }
+
+        if (timeReached(nowMs, g_nextCommAtMs))
+        {
+            stepEnter(Step::STEP_PUBLISH, nowMs);
+            break;
+        }
+
+        if (!shouldKeepConnectedNow())
+        {
             stepEnter(Step::STEP_MQTT_DISCONNECT, nowMs);
+            break;
+        }
 
         break;
-    }
 
     case Step::STEP_MQTT_DISCONNECT:
-        stepEnter(Step::STEP_RF_OFF, nowMs);
+        if (stepTimedOut(nowMs))
+        {
+            if (shouldKeepConnectedNow())
+            {
+                stepEnter(Step::STEP_IDLE_WAIT, nowMs);
+            }
+            else
+            {
+                stepEnter(Step::STEP_RF_OFF, nowMs);
+            }
+        }
         break;
 
     case Step::STEP_RF_OFF:
-    {
-        const auto &p = currentProfile();
-        uint32_t effectiveCommMs = p.commIntervalMs;
-        if (p.id == ProfileId::ARMED && g_armedAwakeActive)
-            effectiveCommMs = ARMED_AWAKE_COMM_MS;
-
-        g_nextCommAtMs = nowMs + effectiveCommMs;
-
-        if (p.id == ProfileId::ARMED)
-            stepEnter(Step::STEP_ALARM_WAIT, nowMs);
-        else
-            stepEnter(Step::STEP_PARKED_WAIT, nowMs);
-        break;
-    }
-
-    case Step::STEP_ALARM_WAIT:
-    {
-        if (g_pir.pending)
+        if (stepTimedOut(nowMs))
         {
-            g_nextCommAtMs = nowMs;
+            stepEnter(Step::STEP_IDLE_WAIT, nowMs);
+        }
+        break;
+
+    case Step::STEP_IDLE_WAIT:
+        if (g_pir.pending || timeReached(nowMs, g_nextCommAtMs))
+        {
             stepEnter(Step::STEP_DECIDE, nowMs);
             break;
         }
-        if ((int32_t)(nowMs - g_nextCommAtMs) >= 0)
-            stepEnter(Step::STEP_DECIDE, nowMs);
-        break;
-    }
 
-    case Step::STEP_PARKED_WAIT:
-    {
-        if ((int32_t)(nowMs - g_nextCommAtMs) >= 0)
-            stepEnter(Step::STEP_DECIDE, nowMs);
+        if (shouldKeepConnectedNow() && mqttIsConnected())
+        {
+            stepEnter(Step::STEP_CONNECTED_WAIT, nowMs);
+            break;
+        }
+
+        if (!shouldKeepConnectedNow() && mqttIsConnected())
+        {
+            stepEnter(Step::STEP_MQTT_DISCONNECT, nowMs);
+            break;
+        }
+
         break;
-    }
 
     default:
         stepEnter(Step::STEP_DECIDE, nowMs);

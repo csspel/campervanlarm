@@ -1,5 +1,5 @@
 #pragma once
-#include <Arduino.h>
 
-bool powerInit();   // init PMU + slå på modemets power rails
-
+// Initierar PMU (AXP2101) och slår på den matning som behövs för modemet.
+// Returnerar true om init lyckades, annars false.
+bool powerInit();
