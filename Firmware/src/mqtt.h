@@ -45,6 +45,14 @@ bool mqttPublishPirEvent(uint32_t eventId,
                          uint32_t lastMs,
                          uint8_t srcMask);
 
+// Returnerar true om ett profile-change ACK väntar på att publiceras.
+bool mqttHasPendingProfileAck();
+
+// Publicerar pending profile-change ACK om sådan finns.
+// Returnerar true om inget ACK väntar eller om publiceringen lyckades.
+// Returnerar false om ACK väntade men inte kunde publiceras.
+bool mqttPublishPendingProfileAck();
+
 // ------------------------------------------------------------
 // Desired profile sync-status
 // ------------------------------------------------------------

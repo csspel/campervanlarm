@@ -40,6 +40,10 @@ static PubSubClient *mqttClient = nullptr;
 static uint32_t msgCounter = 0;
 static uint32_t lastHandledProfileChangeId = 0;
 static bool desiredProfileSeenThisConnect = false;
+static bool g_profileAckPending = false;
+static uint32_t g_profileAckPendingId = 0;
+static String g_profileAckPendingStatus;
+static String g_profileAckPendingDetail;
 
 // Hook från pipeline som används när HA/server kvitterar PIR-event.
 extern void pipelineOnPirAck(uint32_t eventId);
@@ -145,10 +149,10 @@ static String mqttBuildCommonJsonFields(const char *msgType, bool includeMsgId)
 //
 // För profiländringar skickar vi nu primärt profile_change_id,
 // men skickar även ack_msg_id med samma värde för bakåtkompatibilitet.
-static void mqttPublishAck(uint32_t profileChangeId, const char *status, const char *detail = "")
+static bool mqttPublishAck(uint32_t profileChangeId, const char *status, const char *detail = "")
 {
   if (!mqttClient || !mqttClient->connected())
-    return;
+    return false;
 
   String payload = "{";
   payload += "\"device_id\":\"" + String(DEVICE_ID) + "\",";
@@ -168,6 +172,54 @@ static void mqttPublishAck(uint32_t profileChangeId, const char *status, const c
 
   bool ok = mqttClient->publish(MQTT_TOPIC_ACK, payload.c_str(), false);
   logSystem(String("MQTT: ACK publish ") + (ok ? "OK" : "FAILED") + " payload=" + payload);
+  return ok;
+}
+
+bool mqttHasPendingProfileAck()
+{
+  return g_profileAckPending;
+}
+
+bool mqttPublishPendingProfileAck()
+{
+  if (!g_profileAckPending)
+  {
+    return true;
+  }
+
+  if (!mqttClient || !mqttClient->connected())
+  {
+    logSystem("MQTT: cannot publish pending profile ACK, not connected");
+    return false;
+  }
+
+  bool ok = mqttPublishAck(g_profileAckPendingId,
+                           g_profileAckPendingStatus.c_str(),
+                           g_profileAckPendingDetail.c_str());
+
+  if (!ok)
+  {
+    return false;
+  }
+
+  g_profileAckPending = false;
+  g_profileAckPendingId = 0;
+  g_profileAckPendingStatus = "";
+  g_profileAckPendingDetail = "";
+
+  return true;
+}
+
+static void mqttQueueProfileAck(uint32_t profileChangeId, const char *status, const char *detail = "")
+{
+  g_profileAckPending = true;
+  g_profileAckPendingId = profileChangeId;
+  g_profileAckPendingStatus = String(status);
+  g_profileAckPendingDetail = String(detail);
+
+  logSystem("MQTT: queued profile ACK id=" + String(profileChangeId) +
+            " status=" + g_profileAckPendingStatus +
+            " detail=" + g_profileAckPendingDetail);
 }
 
 // Hantera desired-profile payload.
@@ -230,15 +282,15 @@ static void mqttHandleDesiredProfileMessage(const String &msg, bool fromLegacyDo
     return;
   }
 
-  // Applicera ny profil
+  // Queuea ACK först så pipeline kan publicera den i ordnad publish-cykel
+  mqttQueueProfileAck(profileChangeId,
+                      "OK",
+                      fromLegacyDownlink ? "profile_set_from_legacy" : "profile_set");
+
+  // Applicera ny profil.
+  // pipelineOnProfileChanged() ser då till att hålla anslutningen uppe
+  // tills publish hunnit gå med nya profilen.
   setProfile(pid);
-
-  mqttPublishAck(profileChangeId,
-                 "OK",
-                 fromLegacyDownlink ? "profile_set_from_legacy" : "profile_set");
-
-  // Publicera alive direkt så HA snabbt ser aktuell profil.
-  mqttPublishAlive();
 }
 
 // ============================================================
