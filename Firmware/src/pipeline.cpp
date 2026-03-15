@@ -53,6 +53,11 @@ static uint32_t g_nextCommAtMs = 0;
 // När TRIGGERED ska återgå till ARMED.
 static uint32_t g_triggeredUntilMs = 0;
 
+// När profil just har ändrats och vi redan har MQTT uppe,
+// ska vi hålla anslutningen uppe tills minst en publish-cykel
+// hunnit gå med nya profilen.
+static bool g_profileChangePublishPending = false;
+
 // ------------------------------------------------------------
 // Boot-profile-sync state
 // ------------------------------------------------------------
@@ -135,6 +140,13 @@ static bool currentProfileUsesPir()
 static bool shouldKeepConnectedNow()
 {
     return currentProfile().keepConnected;
+}
+
+// Om profilbyte väntar på att publiceras ska vi tillfälligt hålla
+// anslutningen uppe även om nya profilen normalt inte är keepConnected.
+static bool shouldHoldConnectionForProfilePublish()
+{
+    return g_profileChangePublishPending;
 }
 
 // Nollställ PIR-outbox.
@@ -450,6 +462,16 @@ void pipelineOnProfileChanged(ProfileId newProfile)
     g_nextCommAtMs = nowMs + currentProfile().commIntervalMs;
 
     // --------------------------------------------------------
+    // Om vi redan är MQTT-anslutna när profil ändras ska vi ge
+    // systemet chans att publicera minst en gång med nya profilen
+    // innan disconnect tillåts.
+    // --------------------------------------------------------
+    if (mqttIsConnected())
+    {
+        g_profileChangePublishPending = true;
+    }
+
+    // --------------------------------------------------------
     // Specialfall:
     // Om profil ändras medan vi fortfarande är i första sync-fönstret
     // efter MQTT connect, ska vi INTE gå direkt till disconnect bara
@@ -461,6 +483,17 @@ void pipelineOnProfileChanged(ProfileId newProfile)
     if (g_bootProfileSyncActive && mqttIsConnected())
     {
         logSystem("PIPELINE: profile changed during boot sync -> publish with new profile");
+        stepEnter(Step::STEP_PUBLISH, nowMs);
+        return;
+    }
+
+    // --------------------------------------------------------
+    // Om vi är anslutna och har pending profilpublish ska vi
+    // gå till publish direkt istället för att disconnecta.
+    // --------------------------------------------------------
+    if (mqttIsConnected() && g_profileChangePublishPending)
+    {
+        logSystem("PIPELINE: profile changed -> publish pending before disconnect");
         stepEnter(Step::STEP_PUBLISH, nowMs);
         return;
     }
@@ -555,11 +588,11 @@ void pipelineTick(uint32_t nowMs)
             break;
         }
 
-        if (shouldKeepConnectedNow() && mqttIsConnected())
+        if ((shouldKeepConnectedNow() || shouldHoldConnectionForProfilePublish()) && mqttIsConnected())
         {
             stepEnter(Step::STEP_CONNECTED_WAIT, nowMs);
         }
-        else if (!shouldKeepConnectedNow() && mqttIsConnected())
+        else if (!(shouldKeepConnectedNow() || shouldHoldConnectionForProfilePublish()) && mqttIsConnected())
         {
             stepEnter(Step::STEP_MQTT_DISCONNECT, nowMs);
         }
@@ -655,22 +688,23 @@ void pipelineTick(uint32_t nowMs)
 
     case Step::STEP_PUBLISH:
     {
+        bool ackOk = mqttPublishPendingProfileAck();
+
         ExtGnssFix fx;
         bool fixOk = buildGpsFromExternal(fx);
+        bool gpsOk = mqttPublishGpsSingle(fx, fixOk);
 
-        // Skicka alltid GPS-single; fixOk anger om positionen är giltig
-        mqttPublishGpsSingle(fx, fixOk);
-
+        bool pirOk = true;
         if (g_pir.pending)
         {
             if (pirCanPublishNow(nowMs))
             {
                 pirMarkPublishedAndLockout(nowMs);
-                mqttPublishPirEvent(g_pir.event_id,
-                                    g_pir.count,
-                                    g_pir.first_ms,
-                                    g_pir.last_ms,
-                                    g_pir.src_mask);
+                pirOk = mqttPublishPirEvent(g_pir.event_id,
+                                            g_pir.count,
+                                            g_pir.first_ms,
+                                            g_pir.last_ms,
+                                            g_pir.src_mask);
             }
             else
             {
@@ -679,18 +713,33 @@ void pipelineTick(uint32_t nowMs)
             }
         }
 
-        mqttPublishAlive();
+        bool aliveOk = mqttPublishAlive();
+
+        // Profilbyte räknas som klart först när:
+        // - pending ACK är publicerad eller ingen ACK väntar
+        // - alive med aktuell profil har publicerats OK
+        if (g_profileChangePublishPending)
+        {
+            if (ackOk && aliveOk && !mqttHasPendingProfileAck())
+            {
+                logSystem("PIPELINE: profile change publish completed");
+                g_profileChangePublishPending = false;
+            }
+            else
+            {
+                logSystem("PIPELINE: profile change publish still pending");
+            }
+        }
 
         // Planera nästa ordinarie kommunikation
         g_nextCommAtMs = nowMs + currentProfile().commIntervalMs;
 
-        if (shouldKeepConnectedNow())
+        if (shouldKeepConnectedNow() || shouldHoldConnectionForProfilePublish())
         {
             stepEnter(Step::STEP_CONNECTED_WAIT, nowMs);
         }
         else
         {
-            // Ge en kort stund för extra downlink efter publish
             stepEnter(Step::STEP_RX_DOWNLINK, nowMs);
         }
 
@@ -734,7 +783,7 @@ void pipelineTick(uint32_t nowMs)
             break;
         }
 
-        if (!shouldKeepConnectedNow())
+        if (!(shouldKeepConnectedNow() || shouldHoldConnectionForProfilePublish()))
         {
             stepEnter(Step::STEP_MQTT_DISCONNECT, nowMs);
             break;
@@ -743,6 +792,13 @@ void pipelineTick(uint32_t nowMs)
         break;
 
     case Step::STEP_MQTT_DISCONNECT:
+        if (shouldHoldConnectionForProfilePublish())
+        {
+            logSystem("PIPELINE: disconnect blocked, waiting for profile publish");
+            stepEnter(Step::STEP_PUBLISH, nowMs);
+            break;
+        }
+
         if (stepTimedOut(nowMs))
         {
             if (shouldKeepConnectedNow())
@@ -770,13 +826,13 @@ void pipelineTick(uint32_t nowMs)
             break;
         }
 
-        if (shouldKeepConnectedNow() && mqttIsConnected())
+        if ((shouldKeepConnectedNow() || shouldHoldConnectionForProfilePublish()) && mqttIsConnected())
         {
             stepEnter(Step::STEP_CONNECTED_WAIT, nowMs);
             break;
         }
 
-        if (!shouldKeepConnectedNow() && mqttIsConnected())
+        if (!(shouldKeepConnectedNow() || shouldHoldConnectionForProfilePublish()) && mqttIsConnected())
         {
             stepEnter(Step::STEP_MQTT_DISCONNECT, nowMs);
             break;

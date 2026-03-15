@@ -1,5 +1,4 @@
 #include "ext_gnss.h"
-
 #include <Arduino.h>
 #include <string.h>
 #include <stdlib.h>
@@ -15,7 +14,7 @@
 // Vi använder nu:
 // - RMC: lat, lon, fart, giltighetsstatus
 // - GGA: fix-quality, satelliter, HDOP, höjd
-// - GSA: fix-mode (1/2/3) och kan senare användas för PDOP/VDOP
+// - GSA: fix-mode (1/2/3)
 // ============================================================
 
 static HardwareSerial GNSS(2);
@@ -54,7 +53,6 @@ static double nmeaDegMinToDec(const char *dm, char hemi)
 }
 
 // Dela upp en NMEA-mening på kommatecken.
-// Returnerar antal fält i tok[].
 static int splitCsv(char *s, char **tok, int maxTok)
 {
     int n = 0;
@@ -74,13 +72,25 @@ static int splitCsv(char *s, char **tok, int maxTok)
     return n;
 }
 
+// ------------------------------------------------------------
+// Rensa parserstatus och senaste fix.
+// Bra vid wake/start av ny burst så vi inte råkar använda
+// gammal data som om den vore ny.
+// ------------------------------------------------------------
+void extGnssClearLatest()
+{
+    slen = 0;
+    g_last = ExtGnssFix{};
+    g_haveRmc = false;
+    g_haveGga = false;
+    g_haveGsa = false;
+}
+
 // ============================================================
 // Sentence handlers
 // ============================================================
 
 // Hantera RMC-mening.
-// Typiskt format:
-// $GNRMC,hhmmss.ss,A,lat,N,lon,E,sog_knots,cog,...
 static void handleRmc(char *s)
 {
     char *tok[20] = {0};
@@ -91,7 +101,6 @@ static void handleRmc(char *s)
 
     const char *status = tok[2];
 
-    // A = valid, V = invalid
     if (!status || status[0] != 'A')
     {
         g_haveRmc = false;
@@ -112,8 +121,6 @@ static void handleRmc(char *s)
 }
 
 // Hantera GGA-mening.
-// Typiskt format:
-// $GNGGA,hhmmss.ss,lat,N,lon,E,fixQuality,numsats,hdop,alt,...
 static void handleGga(char *s)
 {
     char *tok[20] = {0};
@@ -132,7 +139,6 @@ static void handleGga(char *s)
     g_last.hdop = hdop;
     g_last.altM = alt;
 
-    // 0 = ingen giltig fix
     if (fixQuality <= 0)
     {
         g_haveGga = false;
@@ -144,14 +150,6 @@ static void handleGga(char *s)
 }
 
 // Hantera GSA-mening.
-// Typiskt format:
-// $GNGSA,A,3,....,PDOP,HDOP,VDOP
-//
-// Fält:
-// tok[2] = fix mode
-//   1 = no fix
-//   2 = 2D
-//   3 = 3D
 static void handleGsa(char *s)
 {
     char *tok[20] = {0};
@@ -174,8 +172,7 @@ static void handleGsa(char *s)
     }
 }
 
-// Hantera en komplett NMEA-mening.
-// Vi bryr oss just nu om RMC, GGA och GSA.
+// Hantera komplett NMEA-mening.
 static void handleSentence(char *line)
 {
     if (!line || line[0] != '$')
@@ -194,10 +191,6 @@ static void handleSentence(char *line)
         handleGsa(line);
     }
 
-    // Fixa giltighet:
-    // - giltig RMC
-    // - giltig GGA
-    // - och om vi fått GSA så ska fixMode vara minst 2
     bool gsaOk = (!g_haveGsa || g_last.fixMode >= 2);
     g_last.valid = (g_haveRmc && g_haveGga && gsaOk);
 }
@@ -210,11 +203,7 @@ bool extGnssBegin(int rxPin, int txPin, uint32_t baud)
 {
     GNSS.begin(baud, SERIAL_8N1, rxPin, txPin);
 
-    slen = 0;
-    g_last = ExtGnssFix{};
-    g_haveRmc = false;
-    g_haveGga = false;
-    g_haveGsa = false;
+    extGnssClearLatest();
 
     return true;
 }
@@ -230,7 +219,6 @@ void extGnssPoll()
     {
         char ch = (char)GNSS.read();
 
-        // Om ett nytt '$' kommer mitt i en buffert så börjar vi om från den.
         if (ch == '$' && slen > 0)
         {
             sbuf[slen] = 0;
@@ -253,7 +241,6 @@ void extGnssPoll()
         }
         else
         {
-            // Overflow -> kasta aktuell mening
             slen = 0;
         }
 
@@ -264,7 +251,6 @@ void extGnssPoll()
             char *p = strchr(sbuf, '$');
             if (p && p[0] == '$')
             {
-                // Ta bort CR/LF
                 char *cr = strchr(p, '\r');
                 if (cr)
                     *cr = 0;
