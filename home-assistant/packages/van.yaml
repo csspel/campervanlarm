@@ -1,16 +1,23 @@
 # =========================
 # Campervanlarm – HA package (ellie)
 # Topic base: van/ellie/
+#
 # Uplink:
 #   - van/ellie/tele/alive
-#   - van/ellie/tele/gps    (mode: single|batch)
+#   - van/ellie/tele/gps
 #   - van/ellie/tele/pir
-# Downlink:
-#   - van/ellie/cmd/downlink (retain=true, qos=1)
+#
+# Desired state:
+#   - van/ellie/state/desired_profile   (retain=true, qos=1)
+#
+# Downlink commands:
+#   - van/ellie/cmd/downlink            (retain=false)
+#
 # Ack:
-#   - van/ellie/ack          (device -> HA)
+#   - van/ellie/ack                     (device -> HA)
+#
 # Event ACK:
-#   - van/ellie/cmd/ack      (HA -> device)
+#   - van/ellie/cmd/ack                 (HA -> device)
 # =========================
 
 mqtt:
@@ -87,7 +94,6 @@ mqtt:
       force_update: true
 
     # ---------- GPS META ----------
-    # fix_ok från senaste GPS-meddelandet (single: använder p.fix_ok, batch: true om sista fix har lat/lon)
     - name: "Van GPS fix_ok"
       unique_id: van_gps_fix_ok
       state_topic: "van/ellie/tele/gps"
@@ -95,15 +101,11 @@ mqtt:
         {% set p = value_json %}
         {% if p.type == 'GPS' and p.mode == 'single' %}
           {{ p.fix_ok | default(false) }}
-        {% elif p.type == 'GPS' and p.mode == 'batch' and p.fixes is defined and (p.fixes | length) > 0 %}
-          {% set fx = p.fixes[-1] %}
-          {{ (fx[0] is defined) and (fx[1] is defined) and (fx[0] is not none) and (fx[1] is not none) }}
         {% else %}
           {{ states('sensor.van_gps_fix_ok') | default('false') }}
         {% endif %}
       force_update: true
 
-    # epoch_utc från senaste GPS (single eller batch)
     - name: "Van GPS epoch_utc"
       unique_id: van_gps_epoch_utc
       state_topic: "van/ellie/tele/gps"
@@ -111,14 +113,11 @@ mqtt:
         {% set p = value_json %}
         {% if p.type == 'GPS' and p.mode == 'single' %}
           {{ p.epoch_utc | default(0) }}
-        {% elif p.type == 'GPS' and p.mode == 'batch' and p.fixes is defined and (p.fixes | length) > 0 %}
-          {{ (p.t0 | default(0)) + (p.dt | default(0)) * ((p.fixes | length) - 1) }}
         {% else %}
           {{ states('sensor.van_gps_epoch_utc') | int(0) }}
         {% endif %}
       force_update: true
 
-    # Sätter epoch_utc endast när vi har fix_ok + lat/lon (single) eller giltig sista punkt (batch)
     - name: "Van GPS FIX senaste epoch_utc"
       unique_id: van_gps_fix_last_epoch
       state_topic: "van/ellie/tele/gps"
@@ -132,13 +131,6 @@ mqtt:
           {% else %}
             {{ states('sensor.van_gps_fix_senaste_epoch_utc') | int(0) }}
           {% endif %}
-        {% elif p.mode == 'batch' and p.fixes is defined and (p.fixes | length) > 0 %}
-          {% set fx = p.fixes[-1] %}
-          {% if (fx[0] is defined) and (fx[1] is defined) and (fx[0] is not none) and (fx[1] is not none) %}
-            {{ (p.t0 | default(0)) + (p.dt | default(0)) * ((p.fixes | length) - 1) }}
-          {% else %}
-            {{ states('sensor.van_gps_fix_senaste_epoch_utc') | int(0) }}
-          {% endif %}
         {% else %}
           {{ states('sensor.van_gps_fix_senaste_epoch_utc') | int(0) }}
         {% endif %}
@@ -146,82 +138,43 @@ mqtt:
 
   device_tracker:
     - name: "Van Ellie"
-      unique_id: van_ellie_tracker
+      unique_id: van_ellie_tracker_v2
       state_topic: "van/ellie/tele/gps"
+      source_type: gps
 
-      # Uppdatera endast tracker-state när vi har en giltig position (fix ok + lat/lon).
-      # När tom sträng returneras så "studsar" inte kartan på fix-lösa uppdateringar.
       value_template: >
         {% set p = value_json %}
-        {% if p.type != 'GPS' %}
-          ""
-        {% elif p.mode == 'single' %}
-          {% if (p.fix_ok | default(false)) and (p.lat is defined) and (p.lon is defined) and (p.lat is not none) and (p.lon is not none) %}
-            "home"
-          {% else %}
-            ""
-          {% endif %}
-        {% elif p.mode == 'batch' and p.fixes is defined and (p.fixes | length) > 0 %}
-          {% set fx = p.fixes[-1] %}
-          {% if (fx[0] is defined) and (fx[1] is defined) and (fx[0] is not none) and (fx[1] is not none) %}
-            "home"
-          {% else %}
-            ""
-          {% endif %}
+        {% if p.type == 'GPS'
+              and p.mode == 'single'
+              and p.lat is defined and p.lat is not none
+              and p.lon is defined and p.lon is not none %}
+          not_home
         {% else %}
-          ""
+          not_home
         {% endif %}
 
       json_attributes_topic: "van/ellie/tele/gps"
       json_attributes_template: >
         {% set p = value_json %}
-        {% if p.type != 'GPS' %}
-          {}
-        {% elif p.mode == 'single' %}
-          {% set fix = p.fix_ok | default(false) %}
-          {% set has_lat = p.lat is defined and p.lat is not none %}
-          {% set has_lon = p.lon is defined and p.lon is not none %}
-          {% if fix and has_lat and has_lon %}
-            {
-              "latitude": {{ p.lat }},
-              "longitude": {{ p.lon }},
-              "speed_kmh": {{ p.speed_kmh | default(0) }},
-              "epoch_utc": {{ p.epoch_utc | default(0) }},
-              "profile": "{{ p.profile | default('') }}",
-              "fix_ok": true
-            }
-          {% else %}
-            {
-              "epoch_utc": {{ p.epoch_utc | default(0) }},
-              "profile": "{{ p.profile | default('') }}",
-              "fix_ok": false
-            }
-          {% endif %}
-        {% elif p.mode == 'batch' and p.fixes is defined and (p.fixes | length) > 0 %}
-          {% set fx = p.fixes[-1] %}
-          {% set has_lat = fx[0] is defined and fx[0] is not none %}
-          {% set has_lon = fx[1] is defined and fx[1] is not none %}
-          {% if has_lat and has_lon %}
-            {
-              "latitude": {{ fx[0] }},
-              "longitude": {{ fx[1] }},
-              "speed_kmh": {{ fx[4] | default(0) }},
-              "epoch_utc": {{ (p.t0 | default(0)) + (p.dt | default(0)) * ((p.fixes | length) - 1) }},
-              "profile": "{{ p.profile | default('') }}",
-              "fix_ok": true
-            }
-          {% else %}
-            {
-              "epoch_utc": {{ (p.t0 | default(0)) + (p.dt | default(0)) * ((p.fixes | length) - 1) }},
-              "profile": "{{ p.profile | default('') }}",
-              "fix_ok": false
-            }
-          {% endif %}
+        {% if p.type == 'GPS'
+              and p.mode == 'single'
+              and p.lat is defined and p.lat is not none
+              and p.lon is defined and p.lon is not none %}
+          {
+            "latitude": {{ p.lat }},
+            "longitude": {{ p.lon }},
+            "speed_kmh": {{ p.speed_kmh | default(0) }},
+            "alt_m": {{ p.alt_m | default(0) }},
+            "hdop": {{ p.hdop | default(0) }},
+            "sats": {{ p.sats | default(0) }},
+            "epoch_utc": {{ p.epoch_utc | default(0) }},
+            "profile": {{ p.profile | default('') | tojson }},
+            "fix_ok": {{ p.fix_ok | default(false) | tojson }}
+          }
         {% else %}
           {}
         {% endif %}
 
-# ---- UI helpers ----
 input_select:
   van_profile_desired:
     name: "Van läge (önskat)"
@@ -230,29 +183,29 @@ input_select:
       - TRAVEL
       - ARMED
       - TRIGGERED
+      - ALARM
     icon: mdi:van-utility
 
 input_number:
-  van_downlink_msg_id:
-    name: "Van downlink ack_msg_id (räknare)"
+  van_profile_change_id:
+    name: "Van profile change id"
     min: 1
     max: 9999999
     step: 1
     mode: box
 
-  van_last_sent_ack_id:
-    name: "Van senaste skickade ack_msg_id"
+  van_last_sent_profile_change_id:
+    name: "Van senaste skickade profile change id"
     min: 0
     max: 9999999
     step: 1
     mode: box
 
 input_text:
-  van_last_downlink_sent:
-    name: "Van senaste downlink skickat (HA-tid)"
+  van_last_profile_sent:
+    name: "Van senaste profil skickad (HA-tid)"
     max: 32
 
-# ---- Derived sensors / status ----
 template:
   - sensor:
       - name: "Van Alive senast (HA-tid)"
@@ -265,138 +218,180 @@ template:
         unit_of_measurement: "min"
         state_class: measurement
         state: >
-          {% set ts = as_timestamp(states.sensor.van_alive_raw.last_updated) %}
-          {% if ts is number %}
-            {{ ((now().timestamp() - ts) / 60) | round(1) }}
-          {% else %}
-            9999
-          {% endif %}
+          {% set ts = as_timestamp(states.sensor.van_alive_raw.last_updated, default=0) %}
+          {{ ((now().timestamp() - ts) / 60) | round(1) }}
 
       - name: "Van läge (nuvarande)"
         unique_id: van_profile_current
         state: "{{ states('sensor.van_profile_device') }}"
 
-      # GPS fix: senaste tidpunkt (HA-tid) + minuter sedan fix
       - name: "Van GPS fix senast (HA-tid)"
         unique_id: van_gps_fix_last_time
         device_class: timestamp
-        state: >
-          {{ states.sensor.van_gps_fix_senaste_epoch_utc.last_updated }}
+        state: "{{ states.sensor.van_gps_fix_senaste_epoch_utc.last_updated }}"
 
       - name: "Minuter sedan Van GPS fix"
         unique_id: van_minutes_since_gps_fix
         unit_of_measurement: "min"
         state_class: measurement
         state: >
-          {% set ts = as_timestamp(states.sensor.van_gps_fix_senaste_epoch_utc.last_updated) %}
-          {% if ts is number and (states('sensor.van_gps_fix_senaste_epoch_utc') | int(0)) > 0 %}
+          {% set ts = as_timestamp(states.sensor.van_gps_fix_senaste_epoch_utc.last_updated, default=0) %}
+          {% if (states('sensor.van_gps_fix_senaste_epoch_utc') | int(0)) > 0 %}
+            {{ ((now().timestamp() - ts) / 60) | round(1) }}
+          {% else %}
+            9999
+          {% endif %}
+
+      - name: "Minuter sedan PIR fram"
+        unique_id: van_minutes_since_pir_front
+        unit_of_measurement: "min"
+        state: >
+          {% set s = states('sensor.van_pir_fram_senast_intern') %}
+          {% set ts = as_timestamp(s, default=0) %}
+          {% if ts > 0 %}
+            {{ ((now().timestamp() - ts) / 60) | round(1) }}
+          {% else %}
+            9999
+          {% endif %}
+
+      - name: "Minuter sedan PIR bak"
+        unique_id: van_minutes_since_pir_back
+        unit_of_measurement: "min"
+        state: >
+          {% set s = states('sensor.van_pir_bak_senast_intern') %}
+          {% set ts = as_timestamp(s, default=0) %}
+          {% if ts > 0 %}
             {{ ((now().timestamp() - ts) / 60) | round(1) }}
           {% else %}
             9999
           {% endif %}
 
     binary_sensor:
-      - name: "Van väntar på ACK"
-        unique_id: van_waiting_for_ack
-        state: "{{ (states('input_number.van_last_sent_ack_id') | int(0)) > 0 }}"
+      - name: "Van väntar på profil-ACK"
+        unique_id: van_waiting_for_profile_ack
+        state: "{{ (states('input_number.van_last_sent_profile_change_id') | int(0)) > 0 }}"
 
       - name: "Van online"
         unique_id: van_online
         state: >
-          {% set ts = as_timestamp(states.sensor.van_alive_raw.last_updated) %}
-          {% if ts is number %}
-            {{ (now().timestamp() - ts) < 300 }}
-          {% else %}
-            false
-          {% endif %}
+          {% set ts = as_timestamp(states.sensor.van_alive_raw.last_updated, default=0) %}
+          {{ (now().timestamp() - ts) < 300 }}
 
       - name: "Van GPS fix nyligen"
         unique_id: van_gps_fix_recent
         state: >
-          {% set ts = as_timestamp(states.sensor.van_gps_fix_senaste_epoch_utc.last_updated) %}
-          {% if ts is number and (states('sensor.van_gps_fix_senaste_epoch_utc') | int(0)) > 0 %}
+          {% set ts = as_timestamp(states.sensor.van_gps_fix_senaste_epoch_utc.last_updated, default=0) %}
+          {% if (states('sensor.van_gps_fix_senaste_epoch_utc') | int(0)) > 0 %}
             {{ (now().timestamp() - ts) < 600 }}
           {% else %}
             false
           {% endif %}
 
+  - trigger:
+      - platform: mqtt
+        topic: "van/ellie/tele/pir"
+    variables:
+      m: "{{ trigger.payload_json.src_mask | int(0) }}"
+      now_iso: "{{ now().isoformat() }}"
+    binary_sensor:
+      - name: "Van PIR fram"
+        unique_id: van_pir_front_pulse
+        device_class: motion
+        state: "{{ m in [1,3] }}"
+        auto_off: "00:00:30"
+
+      - name: "Van PIR bak"
+        unique_id: van_pir_back_pulse
+        device_class: motion
+        state: "{{ m in [2,3] }}"
+        auto_off: "00:00:30"
+
+    sensor:
+      - name: "Van PIR fram senast (intern)"
+        unique_id: van_pir_front_last_internal
+        device_class: timestamp
+        state: >
+          {% if m in [1,3] %}
+            {{ now_iso }}
+          {% else %}
+            {{ this.state }}
+          {% endif %}
+
+      - name: "Van PIR bak senast (intern)"
+        unique_id: van_pir_back_last_internal
+        device_class: timestamp
+        state: >
+          {% if m in [2,3] %}
+            {{ now_iso }}
+          {% else %}
+            {{ this.state }}
+          {% endif %}
+
 automation:
-  # -------------------------
-  # 1) När du ändrar läge i UI -> skicka retained downlink
-  # -------------------------
-  - id: van_send_profile_downlink
-    alias: "Van: Skicka läge (downlink retained)"
+  # ---------- Publicera önskad profil retained ----------
+  - id: van_publish_desired_profile
+    alias: "Van: Publicera önskad profil"
     mode: single
     trigger:
       - platform: state
         entity_id: input_select.van_profile_desired
     variables:
       new_profile: "{{ trigger.to_state.state }}"
-      next_id: "{{ (states('input_number.van_downlink_msg_id') | int(0)) + 1 }}"
+      next_id: "{{ (states('input_number.van_profile_change_id') | int(0)) + 1 }}"
     action:
       - service: input_number.set_value
         target:
-          entity_id: input_number.van_downlink_msg_id
+          entity_id: input_number.van_profile_change_id
         data:
           value: "{{ next_id }}"
 
       - service: input_number.set_value
         target:
-          entity_id: input_number.van_last_sent_ack_id
+          entity_id: input_number.van_last_sent_profile_change_id
         data:
           value: "{{ next_id }}"
 
       - service: mqtt.publish
         data:
-          topic: "van/ellie/cmd/downlink"
+          topic: "van/ellie/state/desired_profile"
           retain: true
           qos: 1
           payload: >
             {
-              "ack_msg_id": {{ next_id }},
-              "desired_profile": "{{ new_profile }}",
-              "config": {},
-              "commands": []
+              "profile_change_id": {{ next_id }},
+              "desired_profile": "{{ new_profile }}"
             }
 
       - service: input_text.set_value
         target:
-          entity_id: input_text.van_last_downlink_sent
+          entity_id: input_text.van_last_profile_sent
         data:
           value: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
 
-  # -------------------------
-  # 2) När ACK kommer -> om ack_msg_id matchar senaste skickade, rensa retained cmd/downlink
-  # + uppdatera UI direkt från ACK
-  # -------------------------
-  - id: van_clear_downlink_on_ack
-    alias: "Van: Rensa downlink efter ACK"
+  # ---------- När device ACK:ar profiländring ----------
+  - id: van_sync_ui_from_profile_ack
+    alias: "Van: Sync UI från profil-ACK"
     mode: single
     trigger:
       - platform: mqtt
         topic: "van/ellie/ack"
     variables:
       js: "{{ trigger.payload_json }}"
-      ack_id: "{{ js.ack_msg_id | int(0) }}"
-      expected_id: "{{ states('input_number.van_last_sent_ack_id') | int(0) }}"
+      ack_id: "{{ js.profile_change_id | default(js.ack_msg_id) | int(0) }}"
+      expected_id: "{{ states('input_number.van_last_sent_profile_change_id') | int(0) }}"
       status: "{{ js.status | default('') }}"
       applied_profile: "{{ js.profile | default('') }}"
     condition:
       - condition: template
         value_template: "{{ ack_id == expected_id and status == 'OK' }}"
     action:
-      - service: mqtt.publish
-        data:
-          topic: "van/ellie/cmd/downlink"
-          retain: true
-          qos: 1
-          payload: ""
-
       - choose:
           - conditions:
               - condition: template
-                value_template: "{{ applied_profile in ['PARKED','TRAVEL','ARMED','TRIGGERED'] }}"
+                value_template: "{{ applied_profile in ['PARKED','TRAVEL','ARMED','TRIGGERED','ALARM'] }}"
             sequence:
+              - condition: template
+                value_template: "{{ states('input_select.van_profile_desired') != applied_profile }}"
               - service: input_select.select_option
                 target:
                   entity_id: input_select.van_profile_desired
@@ -405,25 +400,25 @@ automation:
 
       - service: input_number.set_value
         target:
-          entity_id: input_number.van_last_sent_ack_id
+          entity_id: input_number.van_last_sent_profile_change_id
         data:
           value: 0
 
-  # -------------------------
-  # 3) Synka UI-läge från device (bara om inget pending)
-  # -------------------------
+  # ---------- Synka UI från faktisk device-profil ----------
   - id: van_sync_ui_profile_from_device
-    alias: "Van: Synka UI-läge från device (bara om inget pending)"
+    alias: "Van: Synka UI-läge från device"
     mode: single
     trigger:
       - platform: state
         entity_id: sensor.van_profile_device
     condition:
       - condition: template
-        value_template: "{{ trigger.to_state.state in ['PARKED','TRAVEL','ARMED','TRIGGERED'] }}"
+        value_template: "{{ trigger.to_state.state in ['PARKED','TRAVEL','ARMED','TRIGGERED','ALARM'] }}"
       - condition: state
-        entity_id: binary_sensor.van_vantar_pa_ack
+        entity_id: binary_sensor.van_vantar_pa_profil_ack
         state: "off"
+      - condition: template
+        value_template: "{{ states('input_select.van_profile_desired') != trigger.to_state.state }}"
     action:
       - service: input_select.select_option
         target:
@@ -431,9 +426,27 @@ automation:
         data:
           option: "{{ trigger.to_state.state }}"
 
-  # -------------------------
-  # 4) PIR-ACK: när PIR-event kommer, skicka ack tillbaka så enheten kan rensa pending
-  # -------------------------
+  # ---------- Återpublicera retained profil efter HA-start ----------
+  - id: van_republish_desired_profile_on_ha_start
+    alias: "Van: Återpublicera önskad profil vid HA-start"
+    mode: single
+    trigger:
+      - platform: homeassistant
+        event: start
+    action:
+      - delay: "00:00:15"
+      - service: mqtt.publish
+        data:
+          topic: "van/ellie/state/desired_profile"
+          retain: true
+          qos: 1
+          payload: >
+            {
+              "profile_change_id": {{ states('input_number.van_profile_change_id') | int(1) }},
+              "desired_profile": "{{ states('input_select.van_profile_desired') }}"
+            }
+
+  # ---------- Auto-ACK av PIR-event ----------
   - id: van_pir_auto_ack
     alias: "Van: Auto-ACK PIR-event"
     mode: queued
