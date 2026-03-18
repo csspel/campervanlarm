@@ -24,11 +24,6 @@ static TinyGsmClient gsmClient(modem);
 // ============================================================
 
 // Hur länge vi väntar på SIM i normal startväg.
-// Tanken här är: "snabb probe", inte lång blockerande väntan.
-static const uint32_t MODEM_SIM_READY_QUICK_WAIT_MS = 1200UL;
-
-// Lite längre SIM-check i fallback-vägen, men fortfarande kort.
-static const uint32_t MODEM_SIM_READY_FALLBACK_WAIT_MS = 2000UL;
 
 // Kortare stabiliseringstid efter RF ON i normalläget.
 static const uint32_t MODEM_RF_SETTLE_NORMAL_MS = 1500UL;

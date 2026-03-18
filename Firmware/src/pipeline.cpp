@@ -10,6 +10,16 @@
 
 // ============================================================
 // PIR outbox
+// ------------------------------------------------------------
+// Här samlar vi ihop PIR-triggers som ska publiceras via MQTT.
+// pending  = det finns ett event som ännu inte är färdigbehandlat
+// event_id = unikt id för aktuell PIR-händelse
+// count    = antal accepterade PIR-triggers i samma event
+// first_ms = första tidpunkt för eventet
+// last_ms  = senaste tidpunkt för eventet
+// src_mask = bitmask för källa:
+//            bit0 = front
+//            bit1 = back
 // ============================================================
 struct PirOutbox
 {
@@ -25,6 +35,15 @@ static PirOutbox g_pir;
 
 // ============================================================
 // PIR filter / lockout
+// ------------------------------------------------------------
+// Vi har två nivåer:
+//
+// 1) ACCEPT_MIN_GAP:
+//    Stoppar studs / alltför täta triggers från samma sensor.
+//
+// 2) THROTTLE + LOCKOUT efter lyckad publish:
+//    Begränsar hur ofta PIR-event får skickas och ignorerar nya
+//    triggers en stund efter lyckad publicering.
 // ============================================================
 static uint32_t g_lastPirAcceptedFrontMs = 0;
 static uint32_t g_lastPirAcceptedBackMs = 0;
@@ -40,6 +59,12 @@ static const uint32_t PIR_LOCKOUT_MS = 60UL * 1000UL;
 
 // ============================================================
 // PIR ISR-state
+// ------------------------------------------------------------
+// ISR:n gör minsta möjliga:
+// - ökar räknare
+// - sätter bit i mask
+//
+// Själva filtrering/publiceringslogik sker i vanlig pipeline-kod.
 // ============================================================
 static volatile uint16_t g_pirIsrCount = 0;
 static volatile uint8_t g_pirIsrMask = 0; // bit0=front, bit1=back
@@ -83,8 +108,7 @@ enum class Step
     STEP_NET_ATTACH,
     STEP_MQTT_CONNECT,
 
-    // Nytt steg:
-    // vänta kort på retained desired_profile efter connect.
+    // Efter MQTT-connect väntar vi kort på retained desired_profile.
     STEP_BOOT_PROFILE_SYNC,
 
     STEP_PUBLISH,
@@ -97,6 +121,14 @@ enum class Step
 
 static Step g_step = Step::STEP_DECIDE;
 static uint32_t g_deadlineMs = 0;
+
+// ============================================================
+// PIR interrupt-läge från config
+// ------------------------------------------------------------
+// Tidigare var attachInterrupt hårdkodat till RISING.
+// Nu låter vi PIR_RISING_EDGE i config.h styra beteendet på riktigt.
+// ============================================================
+static constexpr int PIR_INTERRUPT_MODE = PIR_RISING_EDGE ? RISING : FALLING;
 
 // ============================================================
 // ISR handlers
@@ -173,6 +205,9 @@ static void triggeredExtendTimeout(uint32_t nowMs)
 }
 
 // Returnerar true om pending PIR får publiceras just nu.
+// Regler:
+// - Det måste finnas pending event
+// - Minst en av berörda sensorer måste vara utanför throttle-fönstret
 static bool pirCanPublishNow(uint32_t nowMs)
 {
     if (!g_pir.pending)
@@ -202,6 +237,9 @@ static bool pirCanPublishNow(uint32_t nowMs)
 }
 
 // Markera att PIR har publicerats och sätt lockout.
+// Viktigt:
+// Detta ska bara anropas EFTER att mqttPublishPirEvent() lyckats.
+// Annars riskerar vi att låsa ut retries fast publiceringen misslyckades.
 static void pirMarkPublishedAndLockout(uint32_t nowMs)
 {
     if (!g_pir.pending)
@@ -300,6 +338,8 @@ static bool stepTimedOut(uint32_t nowMs)
 
 // ============================================================
 // PIR ingest
+// ------------------------------------------------------------
+// Här läser vi ut ISR-state och gör all filtrering i vanlig kod.
 // ============================================================
 static void pirIngestIsr(uint32_t nowMs)
 {
@@ -539,8 +579,10 @@ void pipelineInit()
     pinMode(PIN_PIR_FRONT, INPUT_PULLDOWN);
     pinMode(PIN_PIR_BACK, INPUT_PULLDOWN);
 
-    attachInterrupt(digitalPinToInterrupt(PIN_PIR_FRONT), isrPirFront, RISING);
-    attachInterrupt(digitalPinToInterrupt(PIN_PIR_BACK), isrPirBack, RISING);
+    // Viktigt:
+    // Interrupt-läge styrs nu av PIR_RISING_EDGE i config.h.
+    attachInterrupt(digitalPinToInterrupt(PIN_PIR_FRONT), isrPirFront, PIR_INTERRUPT_MODE);
+    attachInterrupt(digitalPinToInterrupt(PIN_PIR_BACK), isrPirBack, PIR_INTERRUPT_MODE);
 
     stepEnter(Step::STEP_DECIDE, millis());
 }
@@ -693,18 +735,29 @@ void pipelineTick(uint32_t nowMs)
         ExtGnssFix fx;
         bool fixOk = buildGpsFromExternal(fx);
         bool gpsOk = mqttPublishGpsSingle(fx, fixOk);
+        (void)gpsOk; // ännu inte använd i styrlogiken
 
         bool pirOk = true;
         if (g_pir.pending)
         {
             if (pirCanPublishNow(nowMs))
             {
-                pirMarkPublishedAndLockout(nowMs);
+                // Viktig ändring:
+                // publicera först, sätt publish-timestamp/lockout efter lyckad publish.
                 pirOk = mqttPublishPirEvent(g_pir.event_id,
                                             g_pir.count,
                                             g_pir.first_ms,
                                             g_pir.last_ms,
                                             g_pir.src_mask);
+
+                if (pirOk)
+                {
+                    pirMarkPublishedAndLockout(nowMs);
+                }
+                else
+                {
+                    logSystem("PIR: publish failed -> keep pending, no lockout");
+                }
             }
             else
             {
@@ -714,6 +767,7 @@ void pipelineTick(uint32_t nowMs)
         }
 
         bool aliveOk = mqttPublishAlive();
+        (void)pirOk; // ännu inte använd i styrlogiken
 
         // Profilbyte räknas som klart först när:
         // - pending ACK är publicerad eller ingen ACK väntar
