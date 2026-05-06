@@ -2,6 +2,7 @@
 #include <Arduino.h>
 #include <string.h>
 #include <stdlib.h>
+#include <ctype.h>
 
 // ============================================================
 // Extern GNSS via UART
@@ -15,6 +16,11 @@
 // - RMC: lat, lon, fart, giltighetsstatus
 // - GGA: fix-quality, satelliter, HDOP, höjd
 // - GSA: fix-mode (1/2/3)
+//
+// Förbättringar i denna version:
+// - NMEA-checksum valideras innan mening används
+// - enkel plausibility-check för lat/lon
+// - lite robustare radslutshantering
 // ============================================================
 
 static HardwareSerial GNSS(2);
@@ -52,6 +58,18 @@ static double nmeaDegMinToDec(const char *dm, char hemi)
     return dec;
 }
 
+// Enkel plausibility-check av koordinater.
+static bool latLonPlausible(double lat, double lon)
+{
+    if (lat < -90.0 || lat > 90.0)
+        return false;
+
+    if (lon < -180.0 || lon > 180.0)
+        return false;
+
+    return true;
+}
+
 // Dela upp en NMEA-mening på kommatecken.
 static int splitCsv(char *s, char **tok, int maxTok)
 {
@@ -70,6 +88,86 @@ static int splitCsv(char *s, char **tok, int maxTok)
     }
 
     return n;
+}
+
+// Konvertera en hex-teckenuppsättning till nibble.
+static int hexNibble(char c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'A' && c <= 'F')
+        return 10 + (c - 'A');
+    if (c >= 'a' && c <= 'f')
+        return 10 + (c - 'a');
+    return -1;
+}
+
+// ------------------------------------------------------------
+// Validera NMEA-checksum.
+//
+// Format:
+//   $.....*HH
+//
+// XOR räknas över alla tecken mellan '$' och '*'.
+// ------------------------------------------------------------
+static bool nmeaChecksumOk(const char *line)
+{
+    if (!line || line[0] != '$')
+        return false;
+
+    const char *star = strchr(line, '*');
+    if (!star)
+        return false;
+
+    // Måste finnas två hextecken efter '*'
+    if (!star[1] || !star[2])
+        return false;
+
+    int hi = hexNibble(star[1]);
+    int lo = hexNibble(star[2]);
+    if (hi < 0 || lo < 0)
+        return false;
+
+    uint8_t expected = (uint8_t)((hi << 4) | lo);
+
+    uint8_t sum = 0;
+    for (const char *p = line + 1; p < star; ++p)
+    {
+        sum ^= (uint8_t)(*p);
+    }
+
+    return sum == expected;
+}
+
+// ------------------------------------------------------------
+// Trimma bort CR/LF i slutet av strängen.
+// ------------------------------------------------------------
+static void trimLineEnd(char *s)
+{
+    if (!s)
+        return;
+
+    int len = (int)strlen(s);
+    while (len > 0 && (s[len - 1] == '\r' || s[len - 1] == '\n'))
+    {
+        s[len - 1] = 0;
+        --len;
+    }
+}
+
+// ------------------------------------------------------------
+// För NMEA-hantering vill vi ofta parsa meningen utan checksum-delen,
+// alltså allt före '*'.
+// Denna funktion skriver 0 på '*' om sådan finns.
+// ------------------------------------------------------------
+static void stripChecksumPart(char *s)
+{
+    if (!s)
+        return;
+
+    char *star = strchr(s, '*');
+    if (star)
+        *star = 0;
 }
 
 // ------------------------------------------------------------
@@ -110,6 +208,14 @@ static void handleRmc(char *s)
 
     double lat = nmeaDegMinToDec(tok[3], tok[4] ? tok[4][0] : 'N');
     double lon = nmeaDegMinToDec(tok[5], tok[6] ? tok[6][0] : 'E');
+
+    if (!latLonPlausible(lat, lon))
+    {
+        g_haveRmc = false;
+        g_last.valid = false;
+        return;
+    }
+
     float sogKn = tok[7] ? atof(tok[7]) : 0.0f;
     float kmh = sogKn * 1.852f;
 
@@ -173,11 +279,28 @@ static void handleGsa(char *s)
 }
 
 // Hantera komplett NMEA-mening.
+// Viktigt:
+// - checksum måste vara korrekt
+// - sedan strippar vi "*HH" innan CSV-split
 static void handleSentence(char *line)
 {
     if (!line || line[0] != '$')
         return;
 
+    trimLineEnd(line);
+
+    if (!nmeaChecksumOk(line))
+    {
+        return;
+    }
+
+    stripChecksumPart(line);
+
+    if (strlen(line) < 6)
+        return;
+
+    // Vi använder talker-oberoende matchning på suffix:
+    // $GPRMC, $GNRMC, $GARMC ... -> "RMC"
     if (strncmp(line + 3, "RMC", 3) == 0)
     {
         handleRmc(line);
@@ -191,6 +314,10 @@ static void handleSentence(char *line)
         handleGsa(line);
     }
 
+    // valid sätts bara om:
+    // - vi har giltig RMC
+    // - vi har giltig GGA
+    // - och om GSA finns så måste den visa minst 2D fix
     bool gsaOk = (!g_haveGsa || g_last.fixMode >= 2);
     g_last.valid = (g_haveRmc && g_haveGga && gsaOk);
 }
@@ -219,6 +346,8 @@ void extGnssPoll()
     {
         char ch = (char)GNSS.read();
 
+        // Om en ny '$' kommer mitt i en redan påbörjad buffert, så försöker vi
+        // avsluta den gamla som "best effort" och börjar sedan om med den nya.
         if (ch == '$' && slen > 0)
         {
             sbuf[slen] = 0;
@@ -241,9 +370,11 @@ void extGnssPoll()
         }
         else
         {
+            // Overflow: kasta aktuell rad och börja om.
             slen = 0;
         }
 
+        // NMEA-rad komplett när LF kommer.
         if (ch == '\n')
         {
             sbuf[slen] = 0;
@@ -251,14 +382,7 @@ void extGnssPoll()
             char *p = strchr(sbuf, '$');
             if (p && p[0] == '$')
             {
-                char *cr = strchr(p, '\r');
-                if (cr)
-                    *cr = 0;
-
-                char *lf = strchr(p, '\n');
-                if (lf)
-                    *lf = 0;
-
+                trimLineEnd(p);
                 handleSentence(p);
             }
 
