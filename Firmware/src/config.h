@@ -42,13 +42,30 @@ static const uint32_t NET_REG_TIMEOUT_MS = 120000UL;
 static const uint32_t DATA_ATTACH_TIMEOUT_MS = 60000UL;
 
 // ============================================================
-// Secrets (MQTT host/user/pass m.m.) – ligger INTE i git
+// Secrets (MQTT host/user/pass, WiFi SSID/lösen m.m.) – ligger INTE i git
 // ============================================================
 #if __has_include("secrets.h")
 #include "secrets.h"
 #else
 #include "secrets_example.h"
 #endif
+
+// ---------------- WiFi fallback / hotspot -------------------
+// Kan överstyras i secrets.h, t.ex.:
+//   #define WIFI_AP_SSID "Pixel 7"
+//   #define WIFI_AP_PASSWORD "ditt_losenord"
+//
+// Standardvärden här används bara om secrets.h inte definierar dem.
+#ifndef WIFI_AP_SSID
+#define WIFI_AP_SSID "NWIFI"
+#endif
+
+#ifndef WIFI_AP_PASSWORD
+#define WIFI_AP_PASSWORD "123124123"
+#endif
+
+// Första WiFi-teststeget: håll timeout relativt kort så systemet inte fastnar.
+constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 20000UL;
 
 // ============================================================
 // MQTT Topics
@@ -61,9 +78,21 @@ static const char MQTT_TOPIC_PIR[] = "van/ellie/tele/pir";
 static const char MQTT_TOPIC_ACK[] = "van/ellie/ack";
 static const char MQTT_TOPIC_VERSION[] = "van/ellie/tele/version";
 
+// -------- Network mode / robust uppkoppling -----------------
+// HA publicerar önskat nätläge här med retain=true.
+static const char MQTT_TOPIC_NET_MODE_DESIRED[] = "van/ellie/state/net_mode_desired";
+
+// Device kvitterar mottaget nätläge här.
+static const char MQTT_TOPIC_ACK_NET_MODE[] = "van/ellie/ack/net_mode";
+
+// Device publicerar aktiv uppkoppling och nätstatus här.
+static const char MQTT_TOPIC_NET_STATUS[] = "van/ellie/tele/net";
+
 // -------- Ny retained desired-state topic -------------------
 // HA publicerar önskad profil här med retain=true.
 static const char MQTT_TOPIC_DESIRED_PROFILE[] = "van/ellie/state/desired_profile";
+
+#define MQTT_TOPIC_HEALTH "van/ellie/tele/health"
 
 // -------- Legacy / framtida kommandotopic -------------------
 // Behålls för migration och ev. framtida engångskommandon.

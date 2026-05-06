@@ -8,6 +8,8 @@
 #include "profiles.h"
 #include "time_manager.h"
 
+#include <WiFi.h>
+
 // ============================================================
 // PIR outbox
 // ------------------------------------------------------------
@@ -116,11 +118,273 @@ enum class Step
     STEP_CONNECTED_WAIT,
     STEP_MQTT_DISCONNECT,
     STEP_RF_OFF,
-    STEP_IDLE_WAIT
+    STEP_IDLE_WAIT,
+
+    // Nytt: kontrollerat återhämtningsläge.
+    STEP_RECOVERY_WAIT
 };
 
 static Step g_step = Step::STEP_DECIDE;
 static uint32_t g_deadlineMs = 0;
+
+// ============================================================
+// Enkel recovery-manager
+// ------------------------------------------------------------
+// Första steget här är medvetet enkelt:
+// - vid enstaka fel: prova om senare
+// - vid flera fel i rad: stäng MQTT / RF och börja om
+// - vid ännu fler fel: power-cycle modemet
+//
+// Detta är inte hela målbilden, men ett tydligt steg upp i robusthet.
+// ============================================================
+enum class RecoveryReason
+{
+    NONE = 0,
+    NET_ATTACH_FAILED,
+    MQTT_CONNECT_TIMEOUT,
+    MQTT_DROPPED,
+    PUBLISH_FAILED,
+    NO_PROGRESS,
+    STEP_TIMEOUT
+};
+
+enum class RecoveryAction
+{
+    NONE = 0,
+    RETRY_LATER,
+    RESTART_LINK,
+    POWER_CYCLE_MODEM
+};
+
+struct RecoveryState
+{
+    RecoveryReason reason = RecoveryReason::NONE;
+    RecoveryAction action = RecoveryAction::NONE;
+    uint8_t consecutiveFailures = 0;
+    uint32_t executeAtMs = 0;
+};
+
+static RecoveryState g_recovery;
+
+// ============================================================
+// Health / driftövervakning
+// ------------------------------------------------------------
+// Dessa värden publiceras på separat health-topic så att Node-RED,
+// InfluxDB och Grafana kan övervaka stabilitet över tid.
+// ============================================================
+static uint32_t g_recoveryCountBoot = 0;
+static uint32_t g_netConnectCountBoot = 0;
+static uint32_t g_mqttConnectCountBoot = 0;
+static uint32_t g_lastNetConnectMs = 0;
+static RecoveryReason g_lastRecoveryReason = RecoveryReason::NONE;
+
+// ============================================================
+// Network link selection – steg 3
+// ------------------------------------------------------------
+// Här väljer pipeline vilken länk som ska provas först och om backup
+// får användas. MQTT är målet: fallback triggas både av länkfel
+// och av MQTT-connect-fel.
+//
+// WIFI_ONLY    -> endast WiFi
+// SIM_ONLY     -> endast SIM
+// WIFI_PRIMARY -> WiFi först, SIM som backup
+// SIM_PRIMARY  -> SIM först, WiFi som backup
+// AUTO         -> WiFi först, SIM som backup tills vidare.
+// ============================================================
+enum class NetAttemptLink
+{
+    NONE = 0,
+    SIM,
+    WIFI
+};
+
+static NetAttemptLink g_netAttemptLink = NetAttemptLink::NONE;
+static NetAttemptLink g_forcedNextNetAttemptLink = NetAttemptLink::NONE;
+static bool g_netAttemptStarted = false;
+static uint32_t g_netAttemptStartedMs = 0;
+static bool g_netFallbackTried = false;
+static String g_lastFallbackReason = "NONE";
+
+static bool modeWantsWifiFirst(const char *mode)
+{
+    if (!mode)
+        return false;
+
+    String m(mode);
+    m.toUpperCase();
+
+    return m == "WIFI_ONLY" || m == "WIFI_PRIMARY" || m == "AUTO";
+}
+
+
+static NetAttemptLink primaryLinkForMode(const char *mode)
+{
+    if (!mode)
+        return NetAttemptLink::SIM;
+
+    String m(mode);
+    m.toUpperCase();
+
+    if (m == "WIFI_ONLY" || m == "WIFI_PRIMARY" || m == "AUTO")
+        return NetAttemptLink::WIFI;
+
+    return NetAttemptLink::SIM;
+}
+
+static NetAttemptLink fallbackLinkForMode(const char *mode, NetAttemptLink failedLink)
+{
+    if (!mode)
+        return NetAttemptLink::NONE;
+
+    String m(mode);
+    m.toUpperCase();
+
+    if ((m == "WIFI_PRIMARY" || m == "AUTO") && failedLink == NetAttemptLink::WIFI)
+        return NetAttemptLink::SIM;
+
+    if (m == "SIM_PRIMARY" && failedLink == NetAttemptLink::SIM)
+        return NetAttemptLink::WIFI;
+
+    return NetAttemptLink::NONE;
+}
+
+static const char *netAttemptLinkName(NetAttemptLink link)
+{
+    switch (link)
+    {
+    case NetAttemptLink::SIM:
+        return "SIM";
+    case NetAttemptLink::WIFI:
+        return "WIFI";
+    default:
+        return "NONE";
+    }
+}
+
+static void wifiPowerOff()
+{
+    if (WiFi.getMode() != WIFI_OFF)
+    {
+        WiFi.disconnect(true, true);
+        WiFi.mode(WIFI_OFF);
+        logSystem("WIFI: off");
+    }
+}
+
+static void startWifiConnect(uint32_t nowMs)
+{
+    g_netAttemptStarted = true;
+    g_netAttemptStartedMs = nowMs;
+
+    mqttUseWifiClient();
+    mqttSetNetStatus("WIFI", false, false, false, 0, -1, "WIFI_CONNECTING");
+
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
+    WiFi.disconnect(false, false);
+    delay(100);
+    WiFi.begin(WIFI_AP_SSID, WIFI_AP_PASSWORD);
+
+    logSystem(String("WIFI: connecting ssid=") + WIFI_AP_SSID);
+}
+
+static bool tickWifiConnect(uint32_t nowMs, bool &ok)
+{
+    ok = false;
+
+    if (!g_netAttemptStarted)
+    {
+        startWifiConnect(nowMs);
+        return false;
+    }
+
+    wl_status_t st = WiFi.status();
+
+    if (st == WL_CONNECTED)
+    {
+        int rssi = WiFi.RSSI();
+        String ip = WiFi.localIP().toString();
+
+        mqttUseWifiClient();
+        mqttSetNetStatus("WIFI", true, false, false, rssi, -1, "NONE");
+
+        logSystem("WIFI: connected OK ip=" + ip + " rssi=" + String(rssi));
+        ok = true;
+        return true;
+    }
+
+    if ((uint32_t)(nowMs - g_netAttemptStartedMs) >= WIFI_CONNECT_TIMEOUT_MS)
+    {
+        mqttSetNetStatus("NONE", false, false, false, 0, -1, "WIFI_TIMEOUT");
+        logSystem("WIFI: connect timeout");
+        wifiPowerOff();
+        ok = false;
+        return true;
+    }
+
+    return false;
+}
+
+
+static void requestRecovery(RecoveryReason reason, uint32_t nowMs);
+static void stepEnter(Step s, uint32_t nowMs);
+
+static void cleanupNetAttemptLink(NetAttemptLink link)
+{
+    if (link == NetAttemptLink::WIFI)
+    {
+        wifiPowerOff();
+    }
+    else if (link == NetAttemptLink::SIM)
+    {
+        modemAbortConnectData();
+        modemRfOff();
+    }
+}
+
+static bool tryFallbackOrRecovery(RecoveryReason reason, const char *failReason, uint32_t nowMs)
+{
+    NetAttemptLink fallback = fallbackLinkForMode(mqttGetDesiredNetMode(), g_netAttemptLink);
+
+    if (!g_netFallbackTried && fallback != NetAttemptLink::NONE)
+    {
+        const char *fromName = netAttemptLinkName(g_netAttemptLink);
+        const char *toName = netAttemptLinkName(fallback);
+
+        g_netFallbackTried = true;
+        g_lastFallbackReason = String(failReason && failReason[0] ? failReason : "PRIMARY_FAILED") +
+                               "_FALLBACK_TO_" + String(toName);
+
+        logSystem(String("PIPELINE: fallback ") + fromName + " -> " + toName +
+                  " reason=" + g_lastFallbackReason);
+
+        mqttDisconnect();
+        cleanupNetAttemptLink(g_netAttemptLink);
+
+        mqttSetNetStatus("NONE", false, false, false, 0, -1, g_lastFallbackReason.c_str());
+
+        g_forcedNextNetAttemptLink = fallback;
+        stepEnter(Step::STEP_NET_ATTACH, nowMs);
+        return true;
+    }
+
+    requestRecovery(reason, nowMs);
+    return false;
+}
+
+// ============================================================
+// Progress-spårning
+// ------------------------------------------------------------
+// Hjälper oss att se om systemet gör verkliga framsteg.
+// ============================================================
+static uint32_t g_lastProgressMs = 0;
+static uint32_t g_lastSuccessfulMqttConnectMs = 0;
+static uint32_t g_lastSuccessfulPublishMs = 0;
+
+// När vi förväntar oss framsteg i keepConnected-lägen.
+// Detta används för att upptäcka "halvdött" läge där MQTT ser
+// levande ut men inga riktiga publiceringar lyckas längre.
+static const uint32_t PIPE_NO_PROGRESS_LIMIT_MS = 5UL * 60UL * 1000UL;
 
 // ============================================================
 // PIR interrupt-läge från config
@@ -179,6 +443,123 @@ static bool shouldKeepConnectedNow()
 static bool shouldHoldConnectionForProfilePublish()
 {
     return g_profileChangePublishPending;
+}
+
+// Namn för step i loggar.
+static const char *stepName(Step s)
+{
+    switch (s)
+    {
+    case Step::STEP_DECIDE:
+        return "DECIDE";
+    case Step::STEP_NET_ATTACH:
+        return "NET_ATTACH";
+    case Step::STEP_MQTT_CONNECT:
+        return "MQTT_CONNECT";
+    case Step::STEP_BOOT_PROFILE_SYNC:
+        return "BOOT_PROFILE_SYNC";
+    case Step::STEP_PUBLISH:
+        return "PUBLISH";
+    case Step::STEP_RX_DOWNLINK:
+        return "RX_DOWNLINK";
+    case Step::STEP_CONNECTED_WAIT:
+        return "CONNECTED_WAIT";
+    case Step::STEP_MQTT_DISCONNECT:
+        return "MQTT_DISCONNECT";
+    case Step::STEP_RF_OFF:
+        return "RF_OFF";
+    case Step::STEP_IDLE_WAIT:
+        return "IDLE_WAIT";
+    case Step::STEP_RECOVERY_WAIT:
+        return "RECOVERY_WAIT";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+static const char *recoveryReasonName(RecoveryReason r)
+{
+    switch (r)
+    {
+    case RecoveryReason::NONE:
+        return "NONE";
+    case RecoveryReason::NET_ATTACH_FAILED:
+        return "NET_ATTACH_FAILED";
+    case RecoveryReason::MQTT_CONNECT_TIMEOUT:
+        return "MQTT_CONNECT_TIMEOUT";
+    case RecoveryReason::MQTT_DROPPED:
+        return "MQTT_DROPPED";
+    case RecoveryReason::PUBLISH_FAILED:
+        return "PUBLISH_FAILED";
+    case RecoveryReason::NO_PROGRESS:
+        return "NO_PROGRESS";
+    case RecoveryReason::STEP_TIMEOUT:
+        return "STEP_TIMEOUT";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+static const char *recoveryActionName(RecoveryAction a)
+{
+    switch (a)
+    {
+    case RecoveryAction::NONE:
+        return "NONE";
+    case RecoveryAction::RETRY_LATER:
+        return "RETRY_LATER";
+    case RecoveryAction::RESTART_LINK:
+        return "RESTART_LINK";
+    case RecoveryAction::POWER_CYCLE_MODEM:
+        return "POWER_CYCLE_MODEM";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+// Enkel backoff för återförsök.
+static uint32_t recoveryBackoffMs(uint8_t failures)
+{
+    if (failures <= 1)
+        return 5000UL;
+    if (failures == 2)
+        return 15000UL;
+    if (failures == 3)
+        return 30000UL;
+    if (failures == 4)
+        return 60000UL;
+    return 120000UL;
+}
+
+// Bestäm recovery-nivå utifrån antal fel i rad.
+// Första fel: prova om senare.
+// Sedan: starta om länk.
+// Till sist: power-cycle modem.
+static RecoveryAction chooseRecoveryAction(uint8_t consecutiveFailures)
+{
+    if (consecutiveFailures <= 1)
+        return RecoveryAction::RETRY_LATER;
+    if (consecutiveFailures <= 3)
+        return RecoveryAction::RESTART_LINK;
+    return RecoveryAction::POWER_CYCLE_MODEM;
+}
+
+// Markera att systemet gjort verkligt framsteg.
+static void markProgress(uint32_t nowMs, const char *reason)
+{
+    g_lastProgressMs = nowMs;
+    logSystemf("PIPELINE: progress -> %s", reason);
+}
+
+// Markera att systemet är friskt igen.
+static void markHealthy(uint32_t nowMs, const char *reason)
+{
+    g_recovery.reason = RecoveryReason::NONE;
+    g_recovery.action = RecoveryAction::NONE;
+    g_recovery.consecutiveFailures = 0;
+    g_recovery.executeAtMs = 0;
+
+    markProgress(nowMs, reason);
 }
 
 // Nollställ PIR-outbox.
@@ -271,18 +652,135 @@ static bool buildGpsFromExternal(ExtGnssFix &out)
 #endif
 }
 
+// Begär recovery och gå till RECOVERY_WAIT.
+static void requestRecovery(RecoveryReason reason, uint32_t nowMs)
+{
+    modemAbortConnectData();
+    g_netAttemptStarted = false;
+    g_netAttemptLink = NetAttemptLink::NONE;
+
+    g_recovery.reason = reason;
+    g_recovery.consecutiveFailures++;
+    g_recovery.action = chooseRecoveryAction(g_recovery.consecutiveFailures);
+    g_recovery.executeAtMs = nowMs + recoveryBackoffMs(g_recovery.consecutiveFailures);
+
+    g_recoveryCountBoot++;
+    g_lastRecoveryReason = reason;
+
+    logSystemf("RECOVERY: requested reason=%s action=%s failures=%u backoff_ms=%lu",
+               recoveryReasonName(g_recovery.reason),
+               recoveryActionName(g_recovery.action),
+               (unsigned)g_recovery.consecutiveFailures,
+               (unsigned long)recoveryBackoffMs(g_recovery.consecutiveFailures));
+
+    g_bootProfileSyncActive = false;
+    g_profileChangePublishPending = false;
+    g_deadlineMs = g_recovery.executeAtMs;
+    g_step = Step::STEP_RECOVERY_WAIT;
+}
+
+// Utför recovery-åtgärd när backoff gått ut.
+static void performRecovery(uint32_t nowMs)
+{
+    if (!timeReached(nowMs, g_recovery.executeAtMs))
+        return;
+
+    logSystemf("RECOVERY: execute reason=%s action=%s failures=%u",
+               recoveryReasonName(g_recovery.reason),
+               recoveryActionName(g_recovery.action),
+               (unsigned)g_recovery.consecutiveFailures);
+
+    // Städa alltid först.
+    modemAbortConnectData();
+    mqttDisconnect();
+
+    if (String(mqttGetActiveLink()) == "WIFI")
+    {
+        wifiPowerOff();
+    }
+
+    switch (g_recovery.action)
+    {
+    case RecoveryAction::RETRY_LATER:
+        // Ingen hård åtgärd, bara börja om kontrollerat.
+        if (!shouldKeepConnectedNow())
+        {
+            modemRfOff();
+        }
+        g_nextCommAtMs = nowMs + currentProfile().commIntervalMs;
+        g_step = Step::STEP_DECIDE;
+        g_deadlineMs = 0;
+        break;
+
+    case RecoveryAction::RESTART_LINK:
+        // Lättare återstart av kommunikationskedjan.
+        modemRfOff();
+        g_nextCommAtMs = nowMs + 2000UL;
+        g_step = Step::STEP_DECIDE;
+        g_deadlineMs = 0;
+        break;
+
+    case RecoveryAction::POWER_CYCLE_MODEM:
+        // Tyngsta åtgärden som finns tillgänglig i nuvarande gränssnitt.
+        modemPowerCycle();
+        g_nextCommAtMs = nowMs + 3000UL;
+        g_step = Step::STEP_DECIDE;
+        g_deadlineMs = 0;
+        break;
+
+    default:
+        g_step = Step::STEP_DECIDE;
+        g_deadlineMs = 0;
+        break;
+    }
+}
+
 // Gå in i nytt step och sätt eventuell timeout/omedelbar åtgärd.
 static void stepEnter(Step s, uint32_t nowMs)
 {
+    Step old = g_step;
+
+    // Om vi lämnar NET_ATTACH ska ett ev. pågående attach-försök avbrytas.
+    if (old == Step::STEP_NET_ATTACH && s != Step::STEP_NET_ATTACH)
+    {
+        modemAbortConnectData();
+    }
+
     g_step = s;
 
     switch (s)
     {
     case Step::STEP_DECIDE:
+        g_deadlineMs = 0;
         break;
 
     case Step::STEP_NET_ATTACH:
-        g_deadlineMs = nowMs + 60000UL;
+        g_netAttemptStarted = false;
+
+        if (g_forcedNextNetAttemptLink != NetAttemptLink::NONE)
+        {
+            g_netAttemptLink = g_forcedNextNetAttemptLink;
+            g_forcedNextNetAttemptLink = NetAttemptLink::NONE;
+        }
+        else
+        {
+            g_netAttemptLink = primaryLinkForMode(mqttGetDesiredNetMode());
+            g_netFallbackTried = false;
+            g_lastFallbackReason = "NONE";
+        }
+
+        if (g_netAttemptLink == NetAttemptLink::WIFI)
+        {
+            g_deadlineMs = nowMs + WIFI_CONNECT_TIMEOUT_MS + 5000UL;
+        }
+        else
+        {
+            // Extra pipeline-timeout som skyddsnät ovanpå modemets egen state machine.
+            g_deadlineMs = nowMs + NET_REG_TIMEOUT_MS + DATA_ATTACH_TIMEOUT_MS + 30000UL;
+        }
+
+        logSystem(String("PIPELINE: NET_ATTACH target=") + netAttemptLinkName(g_netAttemptLink) +
+                  " net_mode=" + mqttGetDesiredNetMode());
         break;
 
     case Step::STEP_MQTT_CONNECT:
@@ -319,7 +817,14 @@ static void stepEnter(Step s, uint32_t nowMs)
 
     case Step::STEP_RF_OFF:
         g_bootProfileSyncActive = false;
-        modemRfOff();
+        if (String(mqttGetActiveLink()) == "WIFI")
+        {
+            wifiPowerOff();
+        }
+        else
+        {
+            modemRfOff();
+        }
         g_deadlineMs = nowMs + 500UL;
         break;
 
@@ -327,12 +832,36 @@ static void stepEnter(Step s, uint32_t nowMs)
         g_bootProfileSyncActive = false;
         g_deadlineMs = g_nextCommAtMs;
         break;
+
+    case Step::STEP_RECOVERY_WAIT:
+        // requestRecovery() sätter deadline direkt.
+        break;
+    }
+
+    if (old != s)
+    {
+        if (g_deadlineMs != 0)
+        {
+            logSystemf("PIPELINE: step %s -> %s deadline_in_ms=%lu",
+                       stepName(old),
+                       stepName(s),
+                       (unsigned long)(g_deadlineMs - nowMs));
+        }
+        else
+        {
+            logSystemf("PIPELINE: step %s -> %s",
+                       stepName(old),
+                       stepName(s));
+        }
     }
 }
 
 // Kontroll om aktuellt step nått deadline.
 static bool stepTimedOut(uint32_t nowMs)
 {
+    if (g_deadlineMs == 0)
+        return false;
+
     return timeReached(nowMs, g_deadlineMs);
 }
 
@@ -565,13 +1094,21 @@ void pipelineInit()
     logSystem("GPS: using external GNSS (UART)");
 #endif
 
+    uint32_t nowMs = millis();
+
     // Första kommunikationsförsök en liten stund efter boot
-    g_nextCommAtMs = millis() + 2000UL;
+    g_nextCommAtMs = nowMs + 2000UL;
+
+    // Progress startas vid boot.
+    g_lastProgressMs = nowMs;
+    g_lastSuccessfulMqttConnectMs = 0;
+    g_lastSuccessfulPublishMs = 0;
 
     // Om defaultprofil inte ska hålla anslutning uppe:
     // stäng RF direkt initialt.
     if (!shouldKeepConnectedNow())
     {
+        wifiPowerOff();
         modemRfOff();
     }
 
@@ -584,7 +1121,7 @@ void pipelineInit()
     attachInterrupt(digitalPinToInterrupt(PIN_PIR_FRONT), isrPirFront, PIR_INTERRUPT_MODE);
     attachInterrupt(digitalPinToInterrupt(PIN_PIR_BACK), isrPirBack, PIR_INTERRUPT_MODE);
 
-    stepEnter(Step::STEP_DECIDE, millis());
+    stepEnter(Step::STEP_DECIDE, nowMs);
 }
 
 // ============================================================
@@ -608,6 +1145,21 @@ void pipelineTick(uint32_t nowMs)
     {
         logSystem("PROFILE: auto return TRIGGERED -> ARMED");
         setProfile(ProfileId::ARMED);
+    }
+
+    // Om vi borde vara uppkopplade men inte gjort några riktiga framsteg
+    // på länge, trigga recovery.
+    if ((shouldKeepConnectedNow() || shouldHoldConnectionForProfilePublish()) &&
+        mqttIsConnected() &&
+        g_step != Step::STEP_RECOVERY_WAIT)
+    {
+        if ((uint32_t)(nowMs - g_lastProgressMs) >= PIPE_NO_PROGRESS_LIMIT_MS)
+        {
+            logSystemf("RECOVERY: no progress for %lu ms while connected",
+                       (unsigned long)(nowMs - g_lastProgressMs));
+            requestRecovery(RecoveryReason::NO_PROGRESS, nowMs);
+            return;
+        }
     }
 
     switch (g_step)
@@ -638,10 +1190,6 @@ void pipelineTick(uint32_t nowMs)
         {
             stepEnter(Step::STEP_MQTT_DISCONNECT, nowMs);
         }
-        else if (!shouldKeepConnectedNow())
-        {
-            stepEnter(Step::STEP_IDLE_WAIT, nowMs);
-        }
         else
         {
             stepEnter(Step::STEP_IDLE_WAIT, nowMs);
@@ -652,30 +1200,99 @@ void pipelineTick(uint32_t nowMs)
 
     case Step::STEP_NET_ATTACH:
     {
-        // OBS: modemConnectData() är fortfarande blockerande.
-        NetResult net;
-        bool ok = modemConnectData(APN, NET_REG_TIMEOUT_MS, DATA_ATTACH_TIMEOUT_MS, net);
-
-        if (ok)
+        // ----------------------------------------------------
+        // WiFi
+        // ----------------------------------------------------
+        // WiFi används direkt i WIFI_ONLY samt som primär/backup
+        // beroende på valt net_mode. Fallback hanteras av
+        // tryFallbackOrRecovery().
+        // ----------------------------------------------------
+        if (g_netAttemptLink == NetAttemptLink::WIFI)
         {
-            // Försök först tid från modemet, sedan NTP
-            timeSyncFromModem();
-            timeSyncFromNtp(8000);
+            bool ok = false;
+            if (tickWifiConnect(nowMs, ok))
+            {
+                if (ok)
+                {
+                    g_netConnectCountBoot++;
+                    g_lastNetConnectMs = nowMs - g_netAttemptStartedMs;
 
-            stepEnter(Step::STEP_MQTT_CONNECT, nowMs);
+                    markProgress(nowMs, "wifi connect ok");
+
+                    // Vid WiFi kan NTP fungera direkt. Modemklocka hoppar vi över.
+                    timeSyncFromNtp(8000);
+
+                    stepEnter(Step::STEP_MQTT_CONNECT, nowMs);
+                    break;
+                }
+
+                logSystem("PIPELINE: wifi attach failed");
+                tryFallbackOrRecovery(RecoveryReason::NET_ATTACH_FAILED, "WIFI_ATTACH_FAILED", nowMs);
+                break;
+            }
+
+            if (stepTimedOut(nowMs))
+            {
+                mqttSetNetStatus("NONE", false, false, false, 0, -1, "WIFI_STEP_TIMEOUT");
+                logSystem("PIPELINE: WIFI NET_ATTACH step timeout");
+                wifiPowerOff();
+                tryFallbackOrRecovery(RecoveryReason::NET_ATTACH_FAILED, "WIFI_STEP_TIMEOUT", nowMs);
+            }
+
             break;
         }
 
-        // Misslyckad attach -> försök igen nästa intervall
-        g_nextCommAtMs = nowMs + currentProfile().commIntervalMs;
+        // ----------------------------------------------------
+        // SIM/modem – samma logik som tidigare
+        // ----------------------------------------------------
+        NetResult net;
+        bool ok = false;
 
-        if (shouldKeepConnectedNow())
+        // Viktigt:
+        // Ticka först. Då hinner vi konsumera DONE_OK / DONE_FAIL
+        // innan vi eventuellt startar ett nytt försök.
+        if (modemTickConnectData(net, ok))
         {
-            stepEnter(Step::STEP_IDLE_WAIT, nowMs);
+            if (ok)
+            {
+                g_netConnectCountBoot++;
+                g_lastNetConnectMs = net.connectMs;
+
+                int csq = modemGetSignalQuality();
+                mqttUseSimClient();
+                mqttSetNetStatus("SIM", false, true, false, 0, csq, "NONE");
+
+                markProgress(nowMs, "net attach ok");
+
+                timeSyncFromModem();
+                timeSyncFromNtp(8000);
+
+                stepEnter(Step::STEP_MQTT_CONNECT, nowMs);
+                break;
+            }
+
+            mqttSetNetStatus("NONE", false, false, false, 0, -1, net.err.c_str());
+            logSystem("PIPELINE: net attach failed err=" + net.err);
+            String reasonText = net.err.length() > 0 ? net.err : "SIM_ATTACH_FAILED";
+            tryFallbackOrRecovery(RecoveryReason::NET_ATTACH_FAILED, reasonText.c_str(), nowMs);
+            break;
         }
-        else
+
+        // Om inget försök pågår just nu startar vi ett nytt.
+        if (!modemIsConnectBusy())
         {
-            stepEnter(Step::STEP_RF_OFF, nowMs);
+            mqttUseSimClient();
+            mqttSetNetStatus("SIM", false, false, false, 0, -1, "SIM_CONNECTING");
+            modemStartConnectData(APN, NET_REG_TIMEOUT_MS, DATA_ATTACH_TIMEOUT_MS);
+            // markProgress(nowMs, "net attach started");
+        }
+
+        // Extra skydd om modemets state machine av någon anledning inte blir klar.
+        if (stepTimedOut(nowMs))
+        {
+            mqttSetNetStatus("NONE", false, false, false, 0, -1, "SIM_STEP_TIMEOUT");
+            logSystem("PIPELINE: NET_ATTACH step timeout");
+            tryFallbackOrRecovery(RecoveryReason::NET_ATTACH_FAILED, "SIM_STEP_TIMEOUT", nowMs);
         }
 
         break;
@@ -684,6 +1301,21 @@ void pipelineTick(uint32_t nowMs)
     case Step::STEP_MQTT_CONNECT:
         if (mqttConnect())
         {
+            g_lastSuccessfulMqttConnectMs = nowMs;
+            g_mqttConnectCountBoot++;
+
+            const char *statusReason = g_netFallbackTried ? g_lastFallbackReason.c_str() : "NONE";
+            if (String(mqttGetActiveLink()) == "WIFI")
+            {
+                mqttSetNetStatus("WIFI", true, false, true, WiFi.RSSI(), -1, statusReason);
+            }
+            else
+            {
+                mqttSetNetStatus("SIM", false, true, true, 0, modemGetSignalQuality(), statusReason);
+            }
+
+            markProgress(nowMs, "mqtt connect ok");
+
             // Viktigt:
             // efter connect går vi INTE direkt till publish,
             // utan ger retained desired_profile en chans först.
@@ -693,27 +1325,24 @@ void pipelineTick(uint32_t nowMs)
 
         if (stepTimedOut(nowMs))
         {
-            g_nextCommAtMs = nowMs + currentProfile().commIntervalMs;
-
-            if (shouldKeepConnectedNow())
-            {
-                stepEnter(Step::STEP_IDLE_WAIT, nowMs);
-            }
-            else
-            {
-                stepEnter(Step::STEP_MQTT_DISCONNECT, nowMs);
-            }
+            logSystem("PIPELINE: MQTT_CONNECT timeout");
+            tryFallbackOrRecovery(RecoveryReason::MQTT_CONNECT_TIMEOUT, "MQTT_CONNECT_TIMEOUT", nowMs);
         }
         break;
 
     case Step::STEP_BOOT_PROFILE_SYNC:
-        // Under detta korta fönster kör vi mqttLoop så att retained
+        // Under detta korta fönstret kör vi mqttLoop så att retained
         // desired_profile faktiskt hinner processas av callbacken.
-        mqttLoop();
+        if (!mqttLoop())
+        {
+            requestRecovery(RecoveryReason::MQTT_DROPPED, nowMs);
+            break;
+        }
 
         // Om retained profil redan hunnit komma kan vi gå vidare direkt.
         if (mqttHasSeenDesiredProfileThisConnect())
         {
+            markProgress(nowMs, "desired profile received");
             logSystem("PIPELINE: desired profile received during boot sync");
             stepEnter(Step::STEP_PUBLISH, nowMs);
             break;
@@ -730,12 +1359,18 @@ void pipelineTick(uint32_t nowMs)
 
     case Step::STEP_PUBLISH:
     {
+        if (!mqttIsConnected())
+        {
+            requestRecovery(RecoveryReason::MQTT_DROPPED, nowMs);
+            break;
+        }
+
         bool ackOk = mqttPublishPendingProfileAck();
 
         ExtGnssFix fx;
         bool fixOk = buildGpsFromExternal(fx);
         bool gpsOk = mqttPublishGpsSingle(fx, fixOk);
-        (void)gpsOk; // ännu inte använd i styrlogiken
+        (void)gpsOk;
 
         bool pirOk = true;
         if (g_pir.pending)
@@ -767,7 +1402,40 @@ void pipelineTick(uint32_t nowMs)
         }
 
         bool aliveOk = mqttPublishAlive();
-        (void)pirOk; // ännu inte använd i styrlogiken
+        bool netStatusOk = mqttPublishNetStatus();
+        bool healthOk = mqttPublishHealth(
+            g_recoveryCountBoot,
+            recoveryReasonName(g_lastRecoveryReason),
+            g_netConnectCountBoot,
+            g_mqttConnectCountBoot,
+            g_lastNetConnectMs,
+            mqttHasPendingProfileAck(),
+            g_pir.pending);
+
+        // Treata detta som lyckad publish-cykel om ALIVE gick igenom,
+        // nätstatus gick igenom och eventuell profile-ACK också gick igenom.
+        bool cycleHealthy = aliveOk && ackOk && netStatusOk && healthOk;
+
+        if (cycleHealthy)
+        {
+            g_lastSuccessfulPublishMs = nowMs;
+            markHealthy(nowMs, "publish cycle ok");
+        }
+        else
+        {
+            logSystemf("PIPELINE: publish cycle degraded ack_ok=%d alive_ok=%d health_ok=%d net_ok=%d pir_ok=%d gps_ok=%d",
+                       ackOk ? 1 : 0,
+                       aliveOk ? 1 : 0,
+                       healthOk ? 1 : 0,
+                       netStatusOk ? 1 : 0,
+                       pirOk ? 1 : 0,
+                       gpsOk ? 1 : 0);
+
+            // Om central publish inte går igenom vill vi inte ligga kvar
+            // i ett halvanslutet läge och hoppas för länge.
+            requestRecovery(RecoveryReason::PUBLISH_FAILED, nowMs);
+            break;
+        }
 
         // Profilbyte räknas som klart först när:
         // - pending ACK är publicerad eller ingen ACK väntar
@@ -801,7 +1469,11 @@ void pipelineTick(uint32_t nowMs)
     }
 
     case Step::STEP_RX_DOWNLINK:
-        mqttLoop();
+        if (!mqttLoop())
+        {
+            requestRecovery(RecoveryReason::MQTT_DROPPED, nowMs);
+            break;
+        }
 
         if (stepTimedOut(nowMs))
         {
@@ -817,13 +1489,36 @@ void pipelineTick(uint32_t nowMs)
         break;
 
     case Step::STEP_CONNECTED_WAIT:
-        if (!mqttIsConnected())
+        if (!mqttLoop())
         {
-            stepEnter(Step::STEP_DECIDE, nowMs);
+            requestRecovery(RecoveryReason::MQTT_DROPPED, nowMs);
             break;
         }
 
-        mqttLoop();
+        // Om HA precis har bytt nätläge från t.ex. SIM till WIFI_ONLY
+        // ska vi inte vänta på nästa reboot. Koppla ner och gå till DECIDE,
+        // så väljer NET_ATTACH rätt länk utifrån det sparade net_mode.
+        if (mqttNetModeSwitchRequested())
+        {
+            logSystem("PIPELINE: net_mode switch requested -> reconnect with selected link");
+            mqttClearNetModeSwitchRequested();
+
+            // Koppla ner befintlig MQTT/länk direkt och gå tillbaka till NET_ATTACH.
+            // I TRAVEL/TRIGGERED/ALARM vill vi inte hamna i IDLE_WAIT, utan byta länk nu.
+            mqttDisconnect();
+
+            if (String(mqttGetActiveLink()) == "WIFI")
+            {
+                wifiPowerOff();
+            }
+            else
+            {
+                modemRfOff();
+            }
+
+            stepEnter(Step::STEP_NET_ATTACH, nowMs);
+            break;
+        }
 
         if (g_pir.pending && pirCanPublishNow(nowMs))
         {
@@ -894,8 +1589,12 @@ void pipelineTick(uint32_t nowMs)
 
         break;
 
+    case Step::STEP_RECOVERY_WAIT:
+        performRecovery(nowMs);
+        break;
+
     default:
-        stepEnter(Step::STEP_DECIDE, nowMs);
+        requestRecovery(RecoveryReason::STEP_TIMEOUT, nowMs);
         break;
     }
 }

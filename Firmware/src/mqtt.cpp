@@ -7,6 +7,8 @@
 #include "time_manager.h"
 
 #include <PubSubClient.h>
+#include <WiFi.h>
+#include <Preferences.h>
 
 // ============================================================
 // MQTT state
@@ -37,13 +39,93 @@
 static Client *netClient = nullptr;
 static PubSubClient mqttClientInstance;
 static PubSubClient *mqttClient = nullptr;
+static WiFiClient wifiClientInstance;
 static uint32_t msgCounter = 0;
+
+// Senaste nätstatus. Pipeline uppdaterar dessa när den väljer SIM/WiFi
+// och när MQTT connect lyckas/misslyckas. mqttPublishNetStatus() skickar dem till HA.
+static String g_activeLink = "SIM";
+static bool g_wifiOk = false;
+static bool g_simOk = true;
+static bool g_mqttOk = false;
+static int g_wifiRssi = 0;
+static int g_modemRssi = -1;
+static String g_lastNetFailReason = "NONE";
 static uint32_t lastHandledProfileChangeId = 0;
 static bool desiredProfileSeenThisConnect = false;
 static bool g_profileAckPending = false;
 static uint32_t g_profileAckPendingId = 0;
 static String g_profileAckPendingStatus;
 static String g_profileAckPendingDetail;
+
+// ============================================================
+// Network mode state
+// ------------------------------------------------------------
+// Första införandet: vi tar emot önskat nätläge från HA, ACK:ar
+// och publicerar status. Själva WiFi/SIM-fallbacken byggs i nästa steg.
+// ============================================================
+static uint32_t lastHandledNetModeChangeId = 0;
+static String g_desiredNetMode = "SIM_PRIMARY";
+static uint32_t g_netModeChangeId = 0;
+static bool g_netModeLoadedFromNvs = false;
+static bool g_netModeSwitchRequested = false;
+
+static Preferences g_netPrefs;
+
+static bool mqttModeWantsWifi(const String &mode)
+{
+  String m = mode;
+  m.toUpperCase();
+  return m == "WIFI_ONLY" || m == "WIFI_PRIMARY" || m == "AUTO";
+}
+
+static bool mqttModeWantsSim(const String &mode)
+{
+  String m = mode;
+  m.toUpperCase();
+  return m == "SIM_ONLY" || m == "SIM_PRIMARY";
+}
+
+static void mqttLoadNetModeFromNvs()
+{
+  if (g_netModeLoadedFromNvs)
+    return;
+
+  g_netModeLoadedFromNvs = true;
+
+  if (!g_netPrefs.begin("van_net", false))
+  {
+    logSystem("MQTT: net mode NVS open failed, using default SIM_PRIMARY");
+    return;
+  }
+
+  String mode = g_netPrefs.getString("mode", "SIM_PRIMARY");
+  uint32_t id = g_netPrefs.getUInt("change_id", 0);
+  mode.toUpperCase();
+
+  if (mode == "SIM_PRIMARY" || mode == "WIFI_PRIMARY" ||
+      mode == "SIM_ONLY" || mode == "WIFI_ONLY" || mode == "AUTO")
+  {
+    g_desiredNetMode = mode;
+    g_netModeChangeId = id;
+    lastHandledNetModeChangeId = id;
+    logSystem("MQTT: loaded net_mode from NVS mode=" + g_desiredNetMode +
+              " change_id=" + String(g_netModeChangeId));
+  }
+  else
+  {
+    logSystem("MQTT: invalid net_mode in NVS, using default SIM_PRIMARY");
+  }
+}
+
+static void mqttSaveNetModeToNvs()
+{
+  mqttLoadNetModeFromNvs();
+  g_netPrefs.putString("mode", g_desiredNetMode);
+  g_netPrefs.putUInt("change_id", g_netModeChangeId);
+  logSystem("MQTT: saved net_mode to NVS mode=" + g_desiredNetMode +
+            " change_id=" + String(g_netModeChangeId));
+}
 
 // Hook från pipeline som används när HA/server kvitterar PIR-event.
 extern void pipelineOnPirAck(uint32_t eventId);
@@ -222,6 +304,112 @@ static void mqttQueueProfileAck(uint32_t profileChangeId, const char *status, co
             " detail=" + g_profileAckPendingDetail);
 }
 
+static bool mqttIsValidNetMode(const String &mode)
+{
+  return mode == "SIM_PRIMARY" ||
+         mode == "WIFI_PRIMARY" ||
+         mode == "SIM_ONLY" ||
+         mode == "WIFI_ONLY" ||
+         mode == "AUTO";
+}
+
+static bool mqttNetModeNeedsWifi(const String &mode)
+{
+  return mqttModeWantsWifi(mode);
+}
+
+static bool mqttPublishNetModeAck(uint32_t changeId,
+                                  bool accepted,
+                                  const char *status,
+                                  const char *detail = "")
+{
+  if (!mqttClient || !mqttClient->connected())
+    return false;
+
+  String payload = "{";
+  payload += "\"device_id\":\"" + String(DEVICE_ID) + "\",";
+  payload += "\"type\":\"NET_MODE_ACK\",";
+  payload += "\"accepted\":" + String(accepted ? "true" : "false") + ",";
+  payload += "\"net_mode_change_id\":" + String(changeId) + ",";
+  payload += "\"change_id\":" + String(changeId) + ",";
+  payload += "\"net_mode\":\"" + g_desiredNetMode + "\",";
+  payload += "\"status\":\"" + String(status) + "\",";
+  payload += "\"detail\":\"" + String(detail) + "\",";
+  payload += "\"active_link\":\"" + g_activeLink + "\",";
+  payload += "\"epoch_utc\":" + String(timeEpochUtc());
+  payload += "}";
+
+  bool ok = mqttClient->publish(MQTT_TOPIC_ACK_NET_MODE, payload.c_str(), false);
+  logSystem(String("MQTT: net_mode ACK publish ") + (ok ? "OK" : "FAILED") +
+            " payload=" + payload);
+  return ok;
+}
+
+static void mqttHandleDesiredNetModeMessage(const String &msg)
+{
+  uint32_t changeId = jsonGetUInt(msg, "net_mode_change_id");
+
+  // HA skickar även generiskt change_id. Använd det som fallback.
+  if (changeId == 0)
+  {
+    changeId = jsonGetUInt(msg, "change_id");
+  }
+
+  String netMode = jsonGetString(msg, "net_mode");
+
+  if (changeId == 0)
+  {
+    mqttPublishNetModeAck(0, false, "ERROR", "missing_net_mode_change_id");
+    return;
+  }
+
+  if (changeId == lastHandledNetModeChangeId)
+  {
+    mqttPublishNetModeAck(changeId, true, "DUPLICATE_IGNORED", "same_net_mode_change_id");
+    return;
+  }
+
+  if (netMode.length() == 0)
+  {
+    mqttPublishNetModeAck(changeId, false, "ERROR", "missing_net_mode");
+    return;
+  }
+
+  netMode.toUpperCase();
+
+  if (!mqttIsValidNetMode(netMode))
+  {
+    mqttPublishNetModeAck(changeId, false, "ERROR", "unknown_net_mode");
+    return;
+  }
+
+  mqttLoadNetModeFromNvs();
+
+  const String oldMode = g_desiredNetMode;
+  const String oldLink = g_activeLink;
+
+  lastHandledNetModeChangeId = changeId;
+  g_desiredNetMode = netMode;
+  g_netModeChangeId = changeId;
+
+  mqttSaveNetModeToNvs();
+
+  // Om HA byter mellan SIM- och WiFi-läge medan vi redan är uppkopplade
+  // behöver pipeline koppla ner och ansluta på nytt med rätt länk.
+  bool wantsWifiNow = mqttModeWantsWifi(g_desiredNetMode);
+  bool activeIsWifi = (oldLink == "WIFI");
+  g_netModeSwitchRequested = (oldMode != g_desiredNetMode) && (wantsWifiNow != activeIsWifi);
+
+  const char *detail = g_netModeSwitchRequested
+                           ? "net_mode_stored_reconnect_requested"
+                           : "net_mode_stored";
+
+  mqttPublishNetModeAck(changeId, true, "OK", detail);
+
+  // Publicera status direkt så HA-UI uppdateras utan att vänta på nästa publish-cykel.
+  mqttPublishNetStatus();
+}
+
 // Hantera desired-profile payload.
 //
 // fromLegacyDownlink:
@@ -342,6 +530,15 @@ static void mqttCallback(char *topic, uint8_t *payload, unsigned int length)
   }
 
   // ----------------------------------------------------------
+  // Topic: MQTT_TOPIC_NET_MODE_DESIRED
+  // ----------------------------------------------------------
+  if (t == MQTT_TOPIC_NET_MODE_DESIRED)
+  {
+    mqttHandleDesiredNetModeMessage(msg);
+    return;
+  }
+
+  // ----------------------------------------------------------
   // Topic: MQTT_TOPIC_DESIRED_PROFILE
   // ----------------------------------------------------------
   if (t == MQTT_TOPIC_DESIRED_PROFILE)
@@ -379,8 +576,59 @@ static void mqttCallback(char *topic, uint8_t *payload, unsigned int length)
 // ============================================================
 // Public API
 // ============================================================
+
+void mqttUseSimClient()
+{
+  if (!mqttClient)
+  {
+    mqttSetup();
+  }
+
+  netClient = &modemGetClient();
+  mqttClient->setClient(*netClient);
+  g_activeLink = "SIM";
+  logSystem("MQTT: selected network client = SIM/modem");
+}
+
+void mqttUseWifiClient()
+{
+  if (!mqttClient)
+  {
+    mqttSetup();
+  }
+
+  netClient = &wifiClientInstance;
+  mqttClient->setClient(*netClient);
+  g_activeLink = "WIFI";
+  logSystem("MQTT: selected network client = WIFI");
+}
+
+void mqttSetNetStatus(const char *activeLink,
+                      bool wifiOk,
+                      bool simOk,
+                      bool mqttOk,
+                      int wifiRssi,
+                      int modemRssi,
+                      const char *lastFailReason)
+{
+  g_activeLink = activeLink ? activeLink : "NONE";
+  g_wifiOk = wifiOk;
+  g_simOk = simOk;
+  g_mqttOk = mqttOk;
+  g_wifiRssi = wifiRssi;
+  g_modemRssi = modemRssi;
+  g_lastNetFailReason = (lastFailReason && strlen(lastFailReason) > 0) ? lastFailReason : "NONE";
+}
+
+const char *mqttGetActiveLink()
+{
+  return g_activeLink.c_str();
+}
+
 void mqttSetup()
 {
+  mqttLoadNetModeFromNvs();
+
   if (!netClient)
   {
     netClient = &modemGetClient();
@@ -428,6 +676,8 @@ bool mqttConnect()
 
   if (!ok)
   {
+    g_mqttOk = false;
+    g_lastNetFailReason = "MQTT_CONNECT_FAILED";
     logSystem("MQTT: connect FAILED, rc=" + String(mqttClient->state()));
     return false;
   }
@@ -435,24 +685,39 @@ bool mqttConnect()
   // Ny anslutning = ny sync-status
   desiredProfileSeenThisConnect = false;
 
+  g_mqttOk = true;
+  g_lastNetFailReason = "NONE";
+
   logSystem("MQTT: connected OK");
 
-  // Ny retained desired-state topic
   bool subDesiredProfile = mqttClient->subscribe(MQTT_TOPIC_DESIRED_PROFILE);
   logSystem(String("MQTT: subscribe ") + MQTT_TOPIC_DESIRED_PROFILE + " " +
             (subDesiredProfile ? "OK" : "FAILED"));
 
-  // Legacy / framtida command topic
   bool subDownlink = mqttClient->subscribe(MQTT_TOPIC_DOWNLINK);
   logSystem(String("MQTT: subscribe ") + MQTT_TOPIC_DOWNLINK + " " +
             (subDownlink ? "OK" : "FAILED"));
 
-  // PIR ACK
   bool subCmdAck = mqttClient->subscribe(MQTT_TOPIC_CMD_ACK);
   logSystem(String("MQTT: subscribe ") + MQTT_TOPIC_CMD_ACK + " " +
             (subCmdAck ? "OK" : "FAILED"));
 
-  return subDesiredProfile && subDownlink && subCmdAck;
+  bool subNetMode = mqttClient->subscribe(MQTT_TOPIC_NET_MODE_DESIRED);
+  logSystem(String("MQTT: subscribe ") + MQTT_TOPIC_NET_MODE_DESIRED + " " +
+            (subNetMode ? "OK" : "FAILED"));
+
+  bool subsOk = subDesiredProfile && subDownlink && subCmdAck && subNetMode;
+
+  if (!subsOk)
+  {
+    g_mqttOk = false;
+    g_lastNetFailReason = "MQTT_SUBSCRIBE_FAILED";
+    logSystem("MQTT: connect incomplete, one or more subscribes failed");
+    mqttClient->disconnect();
+    return false;
+  }
+
+  return true;
 }
 
 bool mqttPublishAlive()
@@ -480,6 +745,48 @@ bool mqttPublishAlive()
   }
 
   logSystem("MQTT: alive published OK");
+  return true;
+}
+
+bool mqttPublishHealth(uint32_t recoveryCountBoot,
+                       const char *lastRecoveryReason,
+                       uint32_t netConnectCountBoot,
+                       uint32_t mqttConnectCountBoot,
+                       uint32_t lastNetConnectMs,
+                       bool pendingProfileAck,
+                       bool pirPending)
+{
+  if (!mqttClient || !mqttClient->connected())
+  {
+    logSystem("MQTT: cannot publish health, not connected");
+    return false;
+  }
+
+  String payload = "{";
+  payload += mqttBuildCommonJsonFields("HEALTH", false) + ",";
+  payload += "\"uptime_s\":" + String(millis() / 1000) + ",";
+  payload += "\"recovery_count_boot\":" + String(recoveryCountBoot) + ",";
+  payload += "\"last_recovery_reason\":\"" + String(lastRecoveryReason) + "\",";
+  payload += "\"net_connect_count_boot\":" + String(netConnectCountBoot) + ",";
+  payload += "\"mqtt_connect_count_boot\":" + String(mqttConnectCountBoot) + ",";
+  payload += "\"last_net_connect_ms\":" + String(lastNetConnectMs) + ",";
+  payload += "\"mqtt_connected\":true,";
+  payload += "\"pending_profile_ack\":" + String(pendingProfileAck ? "true" : "false") + ",";
+  payload += "\"pir_pending\":" + String(pirPending ? "true" : "false");
+  payload += "}";
+
+  logSystem("MQTT: publishing health to " + String(MQTT_TOPIC_HEALTH) + " payload=" + payload);
+  logSystem("MQTT: health payload bytes=" + String(payload.length()));
+
+  bool ok = mqttClient->publish(MQTT_TOPIC_HEALTH, payload.c_str());
+
+  if (!ok)
+  {
+    logSystem("MQTT: health publish FAILED");
+    return false;
+  }
+
+  logSystem("MQTT: health published OK");
   return true;
 }
 
@@ -562,12 +869,102 @@ bool mqttPublishGpsSingle(const ExtGnssFix &fx, bool fixOk)
   return true;
 }
 
-void mqttLoop()
+bool mqttPublishNetStatus()
 {
-  if (mqttClient && mqttClient->connected())
+  mqttLoadNetModeFromNvs();
+
+  if (!mqttClient || !mqttClient->connected())
   {
-    mqttClient->loop();
+    logSystem("MQTT: cannot publish net status, not connected");
+    return false;
   }
+
+  // Uppdatera RSSI precis före publish om respektive länk är aktiv.
+  if (g_activeLink == "WIFI" && WiFi.status() == WL_CONNECTED)
+  {
+    g_wifiRssi = WiFi.RSSI();
+  }
+  if (g_activeLink == "SIM")
+  {
+    g_modemRssi = modemGetSignalQuality();
+  }
+
+  String payload = "{";
+  payload += mqttBuildCommonJsonFields("NET", true) + ",";
+  payload += "\"active_link\":\"" + g_activeLink + "\",";
+  payload += "\"net_mode\":\"" + g_desiredNetMode + "\",";
+  payload += "\"net_mode_change_id\":" + String(g_netModeChangeId) + ",";
+  payload += "\"change_id\":" + String(g_netModeChangeId) + ",";
+  payload += "\"wifi_ok\":" + String(g_wifiOk ? "true" : "false") + ",";
+  payload += "\"sim_ok\":" + String(g_simOk ? "true" : "false") + ",";
+  payload += "\"mqtt_ok\":" + String(g_mqttOk ? "true" : "false") + ",";
+
+  if (g_wifiOk || g_activeLink == "WIFI")
+  {
+    payload += "\"wifi_rssi\":" + String(g_wifiRssi) + ",";
+  }
+  else
+  {
+    payload += "\"wifi_rssi\":null,";
+  }
+
+  if (g_simOk || g_activeLink == "SIM")
+  {
+    payload += "\"modem_rssi\":" + String(g_modemRssi) + ",";
+  }
+  else
+  {
+    payload += "\"modem_rssi\":null,";
+  }
+
+  payload += "\"last_fail_reason\":\"" + g_lastNetFailReason + "\"";
+  payload += "}";
+
+  bool ok = mqttClient->publish(MQTT_TOPIC_NET_STATUS, payload.c_str(), false);
+
+  logSystem(String("MQTT: net status publish ") + (ok ? "OK" : "FAILED") +
+            " payload=" + payload);
+
+  return ok;
+}
+
+const char *mqttGetDesiredNetMode()
+{
+  mqttLoadNetModeFromNvs();
+  return g_desiredNetMode.c_str();
+}
+
+bool mqttNetModeSwitchRequested()
+{
+  return g_netModeSwitchRequested;
+}
+
+void mqttClearNetModeSwitchRequested()
+{
+  g_netModeSwitchRequested = false;
+}
+
+bool mqttLoop()
+{
+  if (!mqttClient)
+  {
+    return false;
+  }
+
+  if (!mqttClient->connected())
+  {
+    return false;
+  }
+
+  bool ok = mqttClient->loop();
+
+  if (!ok && !mqttClient->connected())
+  {
+    logSystem("MQTT: loop detected disconnect");
+    return false;
+  }
+
+  return mqttClient->connected();
 }
 
 void mqttDisconnect()
@@ -577,6 +974,11 @@ void mqttDisconnect()
     logSystem("MQTT: disconnect");
     mqttClient->disconnect();
   }
+
+  g_mqttOk = false;
+
+  // Ny session får ny sync-status.
+  desiredProfileSeenThisConnect = false;
 }
 
 bool mqttIsConnected()
