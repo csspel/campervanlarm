@@ -42,7 +42,11 @@ static const ProfileConfig profileTable[] = {
         false,               // pirFront
         false,               // pirBack
         false,               // keepConnected
-        0                    // autoReturnMs
+        0,                   // autoReturnMs
+        true,                // victronBleEnabled
+        10UL * 60UL * 1000UL,// victronBleIntervalMs = 10 min
+        5UL,                 // victronBleScanSeconds - testscan med duplicate BLE callbacks
+        true                 // victronBleRequiresCommsOff
     },
 
     // TRAVEL
@@ -53,7 +57,11 @@ static const ProfileConfig profileTable[] = {
         false,         // pirFront
         false,         // pirBack
         true,          // keepConnected
-        0              // autoReturnMs
+        0,             // autoReturnMs
+        false,         // victronBleEnabled
+        0,             // victronBleIntervalMs
+        0,             // victronBleScanSeconds
+        false          // victronBleRequiresCommsOff
     },
 
     // ARMED
@@ -64,7 +72,11 @@ static const ProfileConfig profileTable[] = {
         true,                 // pirFront
         true,                 // pirBack
         false,                // keepConnected
-        0                     // autoReturnMs
+        0,                    // autoReturnMs
+        false,                // victronBleEnabled - aktiveras senare när PARKED är testad
+        10UL * 60UL * 1000UL, // victronBleIntervalMs
+        5UL,                  // victronBleScanSeconds - testscan med duplicate BLE callbacks
+        true                  // victronBleRequiresCommsOff
     },
 
     // TRIGGERED
@@ -75,7 +87,11 @@ static const ProfileConfig profileTable[] = {
         true,                // pirFront
         true,                // pirBack
         true,                // keepConnected
-        30UL * 60UL * 1000UL // autoReturnMs = 30 min tillbaka till ARMED
+        30UL * 60UL * 1000UL,// autoReturnMs = 30 min tillbaka till ARMED
+        false,               // victronBleEnabled
+        0,                   // victronBleIntervalMs
+        0,                   // victronBleScanSeconds
+        false                // victronBleRequiresCommsOff
     },
 
     // ALARM
@@ -86,7 +102,11 @@ static const ProfileConfig profileTable[] = {
         true,          // pirFront
         true,          // pirBack
         true,          // keepConnected
-        0              // autoReturnMs
+        0,             // autoReturnMs
+        false,         // victronBleEnabled
+        0,             // victronBleIntervalMs
+        0,             // victronBleScanSeconds
+        false          // victronBleRequiresCommsOff
     },
 };
 

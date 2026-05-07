@@ -46,6 +46,16 @@ struct ProfileConfig
   bool pirBack;
   bool keepConnected;
   uint32_t autoReturnMs;
+
+  // Victron BLE:
+  // - enabled: om profilen får köra BLE-scan
+  // - intervalMs: hur ofta BLE-data ska uppdateras
+  // - scanSeconds: hur lång varje scan ska vara
+  // - requiresCommsOff: true = MQTT/WiFi/SIM ska vara nere innan scan
+  bool victronBleEnabled;
+  uint32_t victronBleIntervalMs;
+  uint32_t victronBleScanSeconds;
+  bool victronBleRequiresCommsOff;
 };
 
 // Initierar aktiv profil vid uppstart.

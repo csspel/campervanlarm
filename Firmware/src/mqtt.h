@@ -85,6 +85,10 @@ bool mqttPublishPendingProfileAck();
 // Första versionen rapporterar önskat nätläge och att aktiv länk fortfarande är SIM.
 bool mqttPublishNetStatus();
 
+// Publicerar Victron BLE-state om ny scan/data finns.
+// Returnerar true om inget behövde publiceras eller om publiceringen lyckades.
+bool mqttPublishVictronStateIfPending();
+
 // Returnerar önskat nätläge som senast mottagits från HA.
 // Värdet läses även från NVS vid boot så enheten kan välja WiFi/SIM
 // innan den hunnit få retained MQTT-state.
