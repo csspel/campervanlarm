@@ -86,6 +86,24 @@ static const char MQTT_TOPIC_VERSION[] = "van/ellie/tele/version";
 #define VICTRON_BLE_ENABLED 1
 #endif
 
+// ============================================================
+// Victron BLE diagnostik
+// ------------------------------------------------------------
+// 0 = normal drift/test: bara kort scan-summary + lyckade dekoderader.
+// 1 = felsökning: logga begränsat antal råa okända/parse-fail-paket.
+// ============================================================
+#ifndef VICTRON_BLE_DIAG_VERBOSE
+#define VICTRON_BLE_DIAG_VERBOSE 0
+#endif
+
+#ifndef VICTRON_BLE_DIAG_MAX_UNKNOWN_PER_SCAN
+#define VICTRON_BLE_DIAG_MAX_UNKNOWN_PER_SCAN 3
+#endif
+
+#ifndef VICTRON_BLE_DIAG_MAX_PARSE_FAIL_PER_SCAN
+#define VICTRON_BLE_DIAG_MAX_PARSE_FAIL_PER_SCAN 3
+#endif
+
 static const char MQTT_TOPIC_VICTRON_STATE[] = "campervan/victron/state";
 constexpr uint32_t VICTRON_FRESH_TIMEOUT_MS = 20UL * 60UL * 1000UL;
 

@@ -208,6 +208,14 @@ public:
     // Stoppar scan och stänger BLE-stacken helt.
     void end();
 
+    // Lätta scanräknare för sammanfattning efter en blockande scan.
+    void resetScanStats();
+    uint32_t getScanAdvSeen() const;
+    uint32_t getScanKnownSeen() const;
+    uint32_t getScanUnknownSeen() const;
+    uint32_t getScanParseFailSeen() const;
+    uint32_t getScanParseSuccessSeen() const;
+
     bool addDevice(const char* name, const char* mac, const char* hexKey,
                    VictronDeviceType type = DEVICE_TYPE_UNKNOWN);
     void setCallback(VictronCallback cb) { callback = cb; }

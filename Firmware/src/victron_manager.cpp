@@ -17,6 +17,9 @@ static uint32_t g_lastScanStartMs = 0;
 static uint32_t g_lastScanEndMs = 0;
 static uint32_t g_scanCountBoot = 0;
 static uint32_t g_deviceUpdateCountBoot = 0;
+static uint32_t g_scanSmartshuntUpdates = 0;
+static uint32_t g_scanSmartsolarUpdates = 0;
+static uint32_t g_scanOrionUpdates = 0;
 
 struct VictronLatestData
 {
@@ -122,6 +125,7 @@ static void onVictronData(const VictronDevice *device)
   {
   case DEVICE_TYPE_SOLAR_CHARGER:
   {
+    g_scanSmartsolarUpdates++;
     const VictronSolarData &s = device->solar;
 
     g_victron.smartsolar_valid = true;
@@ -147,6 +151,7 @@ static void onVictronData(const VictronDevice *device)
 
   case DEVICE_TYPE_BATTERY_MONITOR:
   {
+    g_scanSmartshuntUpdates++;
     const VictronBatteryData &b = device->battery;
 
     g_victron.smartshunt_valid = true;
@@ -169,6 +174,7 @@ static void onVictronData(const VictronDevice *device)
 
   case DEVICE_TYPE_DCDC_CONVERTER:
   {
+    g_scanOrionUpdates++;
     const VictronDCDCData &d = device->dcdc;
 
     g_victron.orion_valid = true;
@@ -261,6 +267,9 @@ bool victronManagerRunScanOnce(uint32_t nowMs, uint32_t scanSeconds)
   g_lastScanStartMs = nowMs;
   g_lastScanEndMs = 0;
   g_scanCountBoot++;
+  g_scanSmartshuntUpdates = 0;
+  g_scanSmartsolarUpdates = 0;
+  g_scanOrionUpdates = 0;
   g_publishPending = true; // publicera även scanstatus om inget hittades
 
   logSystemf("VICTRON: scan start seconds=%lu heap_free=%lu",
@@ -270,14 +279,32 @@ bool victronManagerRunScanOnce(uint32_t nowMs, uint32_t scanSeconds)
   bool ok = configureVictronBle(scanSeconds);
   if (ok && g_victronConfigured)
   {
+    g_victronBle.resetScanStats();
     ok = g_victronBle.scanOnce(scanSeconds);
   }
+
+  const uint32_t advSeen = g_victronBle.getScanAdvSeen();
+  const uint32_t knownSeen = g_victronBle.getScanKnownSeen();
+  const uint32_t unknownSeen = g_victronBle.getScanUnknownSeen();
+  const uint32_t parseFailSeen = g_victronBle.getScanParseFailSeen();
+  const uint32_t parseSuccessSeen = g_victronBle.getScanParseSuccessSeen();
 
   g_victronBle.end();
 
   const uint32_t doneMs = millis();
   g_lastScanEndMs = doneMs;
   g_nextScanAtMs = doneMs + currentProfile().victronBleIntervalMs;
+
+  logSystemf("VICTRON: scan summary configured=%u adv=%lu known=%lu unknown=%lu parse_ok=%lu parse_fail=%lu shunt=%lu solar=%lu orion=%lu",
+             (unsigned)g_victronBle.getDeviceCount(),
+             (unsigned long)advSeen,
+             (unsigned long)knownSeen,
+             (unsigned long)unknownSeen,
+             (unsigned long)parseSuccessSeen,
+             (unsigned long)parseFailSeen,
+             (unsigned long)g_scanSmartshuntUpdates,
+             (unsigned long)g_scanSmartsolarUpdates,
+             (unsigned long)g_scanOrionUpdates);
 
   logSystemf("VICTRON: scan done ok=%d duration_ms=%lu updates_boot=%lu heap_free=%lu",
              ok ? 1 : 0,

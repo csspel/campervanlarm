@@ -7,6 +7,7 @@
  */
 
 #include "VictronBLE.h"
+#include "config.h"
 #include <string.h>
 #include "esp_log.h"
 
@@ -14,6 +15,9 @@
 // Full BLE-debug kan generera enorm loggmängd och trigga watchdog.
 static uint32_t s_victronAdvSeen = 0;
 static uint32_t s_victronKnownSeen = 0;
+static uint32_t s_victronUnknownSeen = 0;
+static uint32_t s_victronParseFailSeen = 0;
+static uint32_t s_victronParseSuccessSeen = 0;
 static uint32_t s_victronUnknownLogged = 0;
 static uint32_t s_victronParseFailLogged = 0;
 
@@ -126,6 +130,23 @@ void VictronBLE::end()
     BLEDevice::deinit(true);
 }
 
+void VictronBLE::resetScanStats()
+{
+    s_victronAdvSeen = 0;
+    s_victronKnownSeen = 0;
+    s_victronUnknownSeen = 0;
+    s_victronParseFailSeen = 0;
+    s_victronParseSuccessSeen = 0;
+    s_victronUnknownLogged = 0;
+    s_victronParseFailLogged = 0;
+}
+
+uint32_t VictronBLE::getScanAdvSeen() const { return s_victronAdvSeen; }
+uint32_t VictronBLE::getScanKnownSeen() const { return s_victronKnownSeen; }
+uint32_t VictronBLE::getScanUnknownSeen() const { return s_victronUnknownSeen; }
+uint32_t VictronBLE::getScanParseFailSeen() const { return s_victronParseFailSeen; }
+uint32_t VictronBLE::getScanParseSuccessSeen() const { return s_victronParseSuccessSeen; }
+
 bool VictronBLE::addDevice(const char *name, const char *mac, const char *hexKey,
                            VictronDeviceType type)
 {
@@ -217,7 +238,8 @@ void VictronBLE::processDevice(BLEAdvertisedDevice &advertisedDevice)
     DeviceEntry *entry = findDevice(normalizedMAC);
     if (!entry)
     {
-        if (s_victronUnknownLogged < 12)
+        s_victronUnknownSeen++;
+        if (VICTRON_BLE_DIAG_VERBOSE && s_victronUnknownLogged < VICTRON_BLE_DIAG_MAX_UNKNOWN_PER_SCAN)
         {
             char rawHex[65];
             bytesToHexLower(reinterpret_cast<const uint8_t *>(raw.data()), raw.length(), rawHex, sizeof(rawHex));
@@ -259,12 +281,16 @@ void VictronBLE::processDevice(BLEAdvertisedDevice &advertisedDevice)
 
     if (parseAdvertisement(entry, mfgData))
     {
+        s_victronParseSuccessSeen++;
         entry->lastNonce = mfgData.nonceDataCounter;
         entry->device.rssi = advertisedDevice.getRSSI();
         entry->device.lastUpdate = now;
     }
-    else if (s_victronParseFailLogged < 12)
+    else
     {
+        s_victronParseFailSeen++;
+        if (VICTRON_BLE_DIAG_VERBOSE && s_victronParseFailLogged < VICTRON_BLE_DIAG_MAX_PARSE_FAIL_PER_SCAN)
+        {
         char rawHex[65];
         bytesToHexLower(reinterpret_cast<const uint8_t *>(raw.data()), raw.length(), rawHex, sizeof(rawHex));
         Serial.printf("VICTRON_DIAG: known_parse_fail name=%s mac=%s rssi=%d len=%u beacon=0x%02X record=0x%02X keymatch=0x%02X key0=0x%02X nonce=0x%04X raw=%s known_seen=%lu\n",
@@ -280,6 +306,7 @@ void VictronBLE::processDevice(BLEAdvertisedDevice &advertisedDevice)
                       rawHex,
                       (unsigned long)s_victronKnownSeen);
         s_victronParseFailLogged++;
+        }
     }
 }
 

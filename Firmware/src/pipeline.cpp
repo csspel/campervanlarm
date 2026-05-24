@@ -1641,7 +1641,9 @@ void pipelineTick(uint32_t nowMs)
             mqttDisconnect();
             wifiPowerOff();
             modemAbortConnectData();
-            modemRfOff();
+            // Modemet är normalt redan RF_OFF efter föregående kommunikationsfönster.
+            // Kör inte CFUN=0 här igen; det kan blockera ~5 s och ge
+            // "CFUN=0 failed" precis före BLE-scan.
         }
 
         victronManagerRunScanOnce(nowMs, currentProfile().victronBleScanSeconds);
