@@ -103,6 +103,33 @@ static bool g_profileChangePublishPending = false;
 static bool g_bootProfileSyncActive = false;
 
 // ============================================================
+// Activity boost från PIR fram
+// ------------------------------------------------------------
+// PIR fram kan ge falska utslag när någon går utanför bilen.
+// Därför används PIR fram i PARKED/ARMED som tyst aktivitetstrigger:
+// - ingen larmnotis
+// - ingen PIR-outbox till HA
+// - ingen automatisk TRIGGERED
+// - tillfälligt tätare GPS/MQTT-kommunikation
+// ============================================================
+struct ActivityBoostState
+{
+    bool active = false;
+    bool activityEventPending = false;
+    bool endEventPending = false;
+    uint32_t startedMs = 0;
+    uint32_t untilMs = 0;
+    uint32_t lastTriggerMs = 0;
+    uint32_t lockoutUntilMs = 0;
+    uint8_t falseBoostCount = 0;
+    bool realEventSeen = false;
+    const char *reason = "NONE";
+};
+
+static ActivityBoostState g_activity;
+
+
+// ============================================================
 // Pipeline state machine
 // ============================================================
 enum class Step
@@ -433,6 +460,14 @@ static inline bool isBefore(uint32_t nowMs, uint32_t untilMs)
 static bool currentProfileUsesPir()
 {
     const auto &p = currentProfile();
+
+#if FRONT_PIR_ACTIVITY_ENABLED
+    // PARKED/ARMED/ALARM ska kunna använda PIR fram som tyst activity-trigger
+    // även om den inte används som skarp larmsensor.
+    if (p.id == ProfileId::PARKED || p.id == ProfileId::ARMED || p.id == ProfileId::ALARM)
+        return true;
+#endif
+
     return p.pirFront || p.pirBack;
 }
 
@@ -447,6 +482,194 @@ static bool shouldKeepConnectedNow()
 static bool shouldHoldConnectionForProfilePublish()
 {
     return g_profileChangePublishPending;
+}
+
+static bool activityBoostAllowedInProfile(ProfileId id)
+{
+#if FRONT_PIR_ACTIVITY_ENABLED
+    return id == ProfileId::PARKED ||
+           id == ProfileId::ARMED ||
+           id == ProfileId::ALARM;
+#else
+    (void)id;
+    return false;
+#endif
+}
+
+static bool activityBoostActive(uint32_t nowMs)
+{
+#if FRONT_PIR_ACTIVITY_ENABLED
+    if (!g_activity.active)
+        return false;
+
+    if (timeReached(nowMs, g_activity.untilMs))
+        return false;
+
+    return true;
+#else
+    (void)nowMs;
+    return false;
+#endif
+}
+
+static uint32_t currentCommIntervalMs(uint32_t nowMs)
+{
+    if (activityBoostActive(nowMs))
+        return ACTIVITY_BOOST_COMM_INTERVAL_MS;
+
+    return currentProfile().commIntervalMs;
+}
+
+static void activityBoostStartOrExtend(uint32_t nowMs, const char *reason)
+{
+#if FRONT_PIR_ACTIVITY_ENABLED
+    if (!activityBoostAllowedInProfile(currentProfile().id))
+        return;
+
+    if (isBefore(nowMs, g_activity.lockoutUntilMs))
+    {
+        logSystem("ACTIVITY: PIR front ignored by activity lockout");
+        return;
+    }
+
+    if (g_activity.lastTriggerMs != 0 &&
+        (uint32_t)(nowMs - g_activity.lastTriggerMs) < ACTIVITY_BOOST_RETRIGGER_GAP_MS)
+    {
+        logSystem("ACTIVITY: PIR front ignored by retrigger gap");
+        return;
+    }
+
+    g_activity.lastTriggerMs = nowMs;
+
+    if (!g_activity.active || timeReached(nowMs, g_activity.untilMs))
+    {
+        g_activity.active = true;
+        g_activity.startedMs = nowMs;
+        g_activity.untilMs = nowMs + ACTIVITY_BOOST_DURATION_MS;
+        g_activity.reason = reason ? reason : "PIR_FRONT";
+        g_activity.realEventSeen = false;
+        g_activity.activityEventPending = true;
+        g_activity.endEventPending = false;
+
+        logSystemf("ACTIVITY: boost started reason=%s duration_s=%lu",
+                   g_activity.reason,
+                   (unsigned long)(ACTIVITY_BOOST_DURATION_MS / 1000UL));
+    }
+    else
+    {
+        uint32_t maxUntil = g_activity.startedMs + ACTIVITY_BOOST_MAX_CONTINUOUS_MS;
+        uint32_t wantedUntil = nowMs + ACTIVITY_BOOST_DURATION_MS;
+
+        g_activity.untilMs = isBefore(wantedUntil, maxUntil) ? wantedUntil : maxUntil;
+        g_activity.activityEventPending = true;
+
+        logSystemf("ACTIVITY: boost extended reason=%s until_ms=%lu",
+                   g_activity.reason,
+                   (unsigned long)g_activity.untilMs);
+    }
+
+    // Starta kommunikation direkt så första tätare GPS/MQTT-cykeln inte väntar.
+    g_nextCommAtMs = nowMs;
+#else
+    (void)nowMs;
+    (void)reason;
+#endif
+}
+
+static void activityBoostTick(uint32_t nowMs)
+{
+#if FRONT_PIR_ACTIVITY_ENABLED
+    if (!g_activity.active)
+        return;
+
+    if (!timeReached(nowMs, g_activity.untilMs))
+        return;
+
+    g_activity.active = false;
+    g_activity.endEventPending = true;
+
+    // Om boost tog slut utan att något annat hanterade profilen, räkna den som "falsk/tyst".
+    // Detta är ett rent strömskydd för platser där folk går förbi ofta.
+    if (!g_activity.realEventSeen)
+    {
+        g_activity.falseBoostCount++;
+        if (g_activity.falseBoostCount >= ACTIVITY_BOOST_FALSE_LIMIT)
+        {
+            g_activity.lockoutUntilMs = nowMs + ACTIVITY_BOOST_FALSE_LOCKOUT_MS;
+            g_activity.falseBoostCount = 0;
+            logSystem("ACTIVITY: false boost limit reached -> front PIR activity lockout");
+        }
+    }
+
+    logSystem("ACTIVITY: boost ended");
+#else
+    (void)nowMs;
+#endif
+}
+
+static bool activityBoostHasPendingMqttEvent()
+{
+#if FRONT_PIR_ACTIVITY_ENABLED
+    return g_activity.activityEventPending || g_activity.endEventPending;
+#else
+    return false;
+#endif
+}
+
+static void activityBoostMarkRealEvent()
+{
+#if FRONT_PIR_ACTIVITY_ENABLED
+    // När något annat faktiskt händer, t.ex. PIR bak/larm/profilbyte, ska inte
+    // tidigare front-boost räknas som falsk.
+    g_activity.falseBoostCount = 0;
+    if (g_activity.active)
+        g_activity.realEventSeen = true;
+#else
+#endif
+}
+
+static void activityBoostCancel()
+{
+#if FRONT_PIR_ACTIVITY_ENABLED
+    g_activity.active = false;
+    g_activity.activityEventPending = false;
+    g_activity.endEventPending = false;
+    g_activity.realEventSeen = false;
+#else
+#endif
+}
+
+static bool activityBoostPublishPending()
+{
+#if FRONT_PIR_ACTIVITY_ENABLED
+    if (g_activity.activityEventPending)
+    {
+        bool ok = mqttPublishActivityEvent(g_activity.reason,
+                                           true,
+                                           ACTIVITY_BOOST_DURATION_MS / 1000UL,
+                                           g_activity.untilMs,
+                                           "front_pir_activity_boost");
+        if (ok)
+            g_activity.activityEventPending = false;
+        return ok;
+    }
+
+    if (g_activity.endEventPending)
+    {
+        bool ok = mqttPublishActivityEvent(g_activity.reason,
+                                           false,
+                                           0,
+                                           g_activity.untilMs,
+                                           "activity_boost_ended");
+        if (ok)
+            g_activity.endEventPending = false;
+        return ok;
+    }
+
+    return true;
+#else
+    return true;
+#endif
 }
 
 // Namn för step i loggar.
@@ -885,24 +1108,31 @@ static bool stepTimedOut(uint32_t nowMs)
 static void pirIngestIsr(uint32_t nowMs)
 {
     uint16_t n;
-    uint8_t mask;
+    uint8_t rawMask;
 
     noInterrupts();
     n = g_pirIsrCount;
-    mask = g_pirIsrMask;
+    rawMask = g_pirIsrMask;
     g_pirIsrCount = 0;
     g_pirIsrMask = 0;
     interrupts();
 
-    if (n == 0 || mask == 0)
+    if (n == 0 || rawMask == 0)
         return;
 
     if (!currentProfileUsesPir())
         return;
 
     const auto &p = currentProfile();
+    uint8_t mask = rawMask;
 
-    if (!p.pirFront)
+    // PIR fram får användas som activity trigger i PARKED/ARMED/ALARM.
+    // PIR bak följer profiltabellen.
+    bool frontAllowed = p.pirFront ||
+                        (FRONT_PIR_ACTIVITY_ENABLED &&
+                         (p.id == ProfileId::PARKED || p.id == ProfileId::ARMED || p.id == ProfileId::ALARM));
+
+    if (!frontAllowed)
         mask &= ~0x01;
     if (!p.pirBack)
         mask &= ~0x02;
@@ -946,7 +1176,7 @@ static void pirIngestIsr(uint32_t nowMs)
     if (acceptedMask == 0)
     {
         logSystemf("PIR: FILTERED (1Hz) raw_n=%u raw_mask=0x%02X",
-                   (unsigned)n, (unsigned)mask);
+                   (unsigned)n, (unsigned)rawMask);
         return;
     }
 
@@ -956,7 +1186,25 @@ static void pirIngestIsr(uint32_t nowMs)
                                                  : "UNKNOWN";
 
     logSystemf("PIR: ACCEPTED which=%s raw_n=%u raw_mask=0x%02X accepted_mask=0x%02X",
-               which, (unsigned)n, (unsigned)mask, (unsigned)acceptedMask);
+               which, (unsigned)n, (unsigned)rawMask, (unsigned)acceptedMask);
+
+    // ------------------------------------------------------------
+    // PIR fram: tyst activity boost i PARKED/ARMED/ALARM.
+    // Den ska inte i sig skapa PIR-larm/outbox eller TRIGGERED.
+    // Om både front och back kommer samtidigt hanteras backen som skarp.
+    // ------------------------------------------------------------
+    if ((acceptedMask & 0x01) &&
+        (p.id == ProfileId::PARKED || p.id == ProfileId::ARMED || p.id == ProfileId::ALARM))
+    {
+        activityBoostStartOrExtend(nowMs, "PIR_FRONT");
+        acceptedMask &= ~0x01;
+    }
+
+    // Om bara PIR fram fanns kvar är vi klara här.
+    if (acceptedMask == 0)
+        return;
+
+    activityBoostMarkRealEvent();
 
     if (!g_pir.pending)
     {
@@ -1006,6 +1254,13 @@ void pipelineOnPirAck(uint32_t eventId)
 void pipelineOnProfileChanged(ProfileId newProfile)
 {
     uint32_t nowMs = millis();
+
+    activityBoostMarkRealEvent();
+
+    if (newProfile == ProfileId::TRAVEL || newProfile == ProfileId::TRIGGERED)
+    {
+        activityBoostCancel();
+    }
 
     // --------------------------------------------------------
     // TRIGGERED: sätt timeout för auto-return till ARMED
@@ -1151,6 +1406,9 @@ void pipelineTick(uint32_t nowMs)
     // Hämta in PIR-data från ISR varje tick
     pirIngestIsr(nowMs);
 
+    // Avsluta activity boost när tiden gått ut. Event publiceras vid nästa MQTT-cykel.
+    activityBoostTick(nowMs);
+
     // Automatisk TRIGGERED -> ARMED när timeout går ut
     if (currentProfile().id == ProfileId::TRIGGERED &&
         currentProfile().autoReturnMs > 0 &&
@@ -1181,7 +1439,7 @@ void pipelineTick(uint32_t nowMs)
     case Step::STEP_DECIDE:
     {
         bool commDue = timeReached(nowMs, g_nextCommAtMs);
-        bool needComm = g_pir.pending || commDue;
+        bool needComm = g_pir.pending || activityBoostHasPendingMqttEvent() || commDue;
 
         if (needComm)
         {
@@ -1395,6 +1653,7 @@ void pipelineTick(uint32_t nowMs)
         }
 
         bool ackOk = mqttPublishPendingProfileAck();
+        bool activityOk = activityBoostPublishPending();
 
         ExtGnssFix fx;
         bool fixOk = buildGpsFromExternal(fx);
@@ -1451,7 +1710,7 @@ void pipelineTick(uint32_t nowMs)
 
         // Treata detta som lyckad publish-cykel om ALIVE gick igenom,
         // nätstatus gick igenom och eventuell profile-ACK också gick igenom.
-        bool cycleHealthy = aliveOk && ackOk && netStatusOk && healthOk;
+        bool cycleHealthy = aliveOk && ackOk && activityOk && netStatusOk && healthOk;
 
         if (cycleHealthy)
         {
@@ -1460,8 +1719,9 @@ void pipelineTick(uint32_t nowMs)
         }
         else
         {
-            logSystemf("PIPELINE: publish cycle degraded ack_ok=%d alive_ok=%d health_ok=%d net_ok=%d pir_ok=%d gps_ok=%d",
+            logSystemf("PIPELINE: publish cycle degraded ack_ok=%d activity_ok=%d alive_ok=%d health_ok=%d net_ok=%d pir_ok=%d gps_ok=%d",
                        ackOk ? 1 : 0,
+                       activityOk ? 1 : 0,
                        aliveOk ? 1 : 0,
                        healthOk ? 1 : 0,
                        netStatusOk ? 1 : 0,
@@ -1490,8 +1750,9 @@ void pipelineTick(uint32_t nowMs)
             }
         }
 
-        // Planera nästa ordinarie kommunikation
-        g_nextCommAtMs = nowMs + currentProfile().commIntervalMs;
+        // Planera nästa kommunikation.
+        // Under activity boost körs GPS/MQTT tätare än profilens normalintervall.
+        g_nextCommAtMs = nowMs + currentCommIntervalMs(nowMs);
 
         if (shouldKeepConnectedNow() || shouldHoldConnectionForProfilePublish())
         {
@@ -1557,6 +1818,12 @@ void pipelineTick(uint32_t nowMs)
             break;
         }
 
+        if (activityBoostHasPendingMqttEvent())
+        {
+            stepEnter(Step::STEP_PUBLISH, nowMs);
+            break;
+        }
+
         if (g_pir.pending && pirCanPublishNow(nowMs))
         {
             stepEnter(Step::STEP_PUBLISH, nowMs);
@@ -1606,7 +1873,7 @@ void pipelineTick(uint32_t nowMs)
         break;
 
     case Step::STEP_IDLE_WAIT:
-        if (g_pir.pending || timeReached(nowMs, g_nextCommAtMs) || victronManagerDue(nowMs, currentProfile()))
+        if (g_pir.pending || activityBoostHasPendingMqttEvent() || timeReached(nowMs, g_nextCommAtMs) || victronManagerDue(nowMs, currentProfile()))
         {
             stepEnter(Step::STEP_DECIDE, nowMs);
             break;

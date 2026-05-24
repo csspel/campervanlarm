@@ -73,6 +73,14 @@ bool mqttPublishPirEvent(uint32_t eventId,
                          uint32_t lastMs,
                          uint8_t srcMask);
 
+// Publicerar en tyst activity boost-händelse från firmware.
+// Används främst för PIR fram i PARKED/ARMED.
+bool mqttPublishActivityEvent(const char *source,
+                              bool boostActive,
+                              uint32_t durationS,
+                              uint32_t untilMs,
+                              const char *detail);
+
 // Returnerar true om ett profile-change ACK väntar på att publiceras.
 bool mqttHasPendingProfileAck();
 

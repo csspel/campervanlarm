@@ -28,7 +28,7 @@ enum class ProfileId
 // - id: intern identifierare
 // - name: namn som används i logg/MQTT
 // - commIntervalMs: hur ofta vi vill publicera alive/GPS
-// - pirFront: om främre PIR är aktiv i denna profil
+// - pirFront: om främre PIR är aktiv i denna profil. I PARKED/ARMED används den som tyst activity trigger.
 // - pirBack: om bakre PIR är aktiv i denna profil
 // - keepConnected: om RF/data/MQTT ska hållas uppe mellan cykler
 // - autoReturnMs: används för profiler som automatiskt ska gå vidare

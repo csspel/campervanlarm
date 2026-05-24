@@ -39,7 +39,7 @@ static const ProfileConfig profileTable[] = {
         ProfileId::PARKED,
         "PARKED",
         5UL * 60UL * 1000UL, // commIntervalMs = 5 min
-        false,               // pirFront
+        true,                // pirFront - används bara som tyst activity trigger i PARKED
         false,               // pirBack
         false,               // keepConnected
         0,                   // autoReturnMs
@@ -73,7 +73,7 @@ static const ProfileConfig profileTable[] = {
         true,                 // pirBack
         false,                // keepConnected
         0,                    // autoReturnMs
-        false,                // victronBleEnabled - aktiveras senare när PARKED är testad
+        true,                 // victronBleEnabled - samma princip som PARKED
         10UL * 60UL * 1000UL, // victronBleIntervalMs
         5UL,                  // victronBleScanSeconds - testscan med duplicate BLE callbacks
         true                  // victronBleRequiresCommsOff

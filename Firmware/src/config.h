@@ -75,12 +75,13 @@ constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 20000UL;
 static const char MQTT_TOPIC_ALIVE[] = "van/ellie/tele/alive";
 static const char MQTT_TOPIC_GPS_SINGLE[] = "van/ellie/tele/gps";
 static const char MQTT_TOPIC_PIR[] = "van/ellie/tele/pir";
+static const char MQTT_TOPIC_ACTIVITY[] = "van/ellie/tele/activity";
 static const char MQTT_TOPIC_ACK[] = "van/ellie/ack";
 static const char MQTT_TOPIC_VERSION[] = "van/ellie/tele/version";
 
 
 // -------- Victron BLE telemetry -----------------------------
-// Första implementationen körs bara schemalagt i PARKED.
+// Schemalagd BLE-avläsning används i de profiler som aktiverar Victron i profiles.cpp.
 // MQTT-topic behålls kompatibel med befintlig Home Assistant victron.yaml.
 #ifndef VICTRON_BLE_ENABLED
 #define VICTRON_BLE_ENABLED 1
@@ -106,6 +107,26 @@ static const char MQTT_TOPIC_VERSION[] = "van/ellie/tele/version";
 
 static const char MQTT_TOPIC_VICTRON_STATE[] = "campervan/victron/state";
 constexpr uint32_t VICTRON_FRESH_TIMEOUT_MS = 20UL * 60UL * 1000UL;
+
+
+// ============================================================
+// Activity boost från PIR fram
+// ------------------------------------------------------------
+// PIR fram används som tyst aktivitetstrigger i PARKED/ARMED.
+// Den ska inte i sig skapa larm eller väcka mobilen.
+// Den gör bara att enheten tillfälligt kommunicerar och skickar GPS oftare,
+// så att verklig förflyttning kan upptäckas snabbare av Home Assistant.
+// ============================================================
+#ifndef FRONT_PIR_ACTIVITY_ENABLED
+#define FRONT_PIR_ACTIVITY_ENABLED 1
+#endif
+
+constexpr uint32_t ACTIVITY_BOOST_DURATION_MS = 20UL * 60UL * 1000UL;       // 20 min
+constexpr uint32_t ACTIVITY_BOOST_COMM_INTERVAL_MS = 60UL * 1000UL;         // 1 min
+constexpr uint32_t ACTIVITY_BOOST_RETRIGGER_GAP_MS = 10UL * 60UL * 1000UL;  // max ny trigger var 10:e min
+constexpr uint32_t ACTIVITY_BOOST_MAX_CONTINUOUS_MS = 30UL * 60UL * 1000UL; // max sammanhängande boost
+constexpr uint8_t ACTIVITY_BOOST_FALSE_LIMIT = 3;                           // antal tysta boosts utan annan händelse
+constexpr uint32_t ACTIVITY_BOOST_FALSE_LOCKOUT_MS = 60UL * 60UL * 1000UL;  // ignorera sedan PIR fram i 60 min
 
 // -------- Network mode / robust uppkoppling -----------------
 // HA publicerar önskat nätläge här med retain=true.

@@ -822,6 +822,37 @@ bool mqttPublishPirEvent(uint32_t eventId,
   return ok;
 }
 
+
+bool mqttPublishActivityEvent(const char *source,
+                              bool boostActive,
+                              uint32_t durationS,
+                              uint32_t untilMs,
+                              const char *detail)
+{
+  if (!mqttClient || !mqttClient->connected())
+  {
+    return false;
+  }
+
+  String payload = "{";
+  payload += mqttBuildCommonJsonFields("ACTIVITY", true) + ",";
+  payload += "\"source\":\"" + String(source ? source : "UNKNOWN") + "\",";
+  payload += "\"boost_active\":" + String(boostActive ? "true" : "false") + ",";
+  payload += "\"boost_duration_s\":" + String(durationS) + ",";
+  payload += "\"boost_until_ms\":" + String(untilMs) + ",";
+  payload += "\"detail\":\"" + String(detail ? detail : "") + "\"";
+  payload += "}";
+
+  bool ok = mqttClient->publish(MQTT_TOPIC_ACTIVITY, payload.c_str(), false);
+
+  logSystem(String("MQTT: activity publish ") + (ok ? "OK" : "FAIL") +
+            " topic=" + String(MQTT_TOPIC_ACTIVITY) +
+            " source=" + String(source ? source : "UNKNOWN") +
+            " active=" + String(boostActive ? "true" : "false"));
+
+  return ok;
+}
+
 bool mqttPublishGpsSingle(const ExtGnssFix &fx, bool fixOk)
 {
   if (!mqttClient || !mqttClient->connected())
