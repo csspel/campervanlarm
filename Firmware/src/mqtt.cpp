@@ -5,6 +5,7 @@
 #include "modem.h"
 #include "profiles.h"
 #include "time_manager.h"
+#include "victron_manager.h"
 
 #include <PubSubClient.h>
 #include <WiFi.h>
@@ -867,6 +868,34 @@ bool mqttPublishGpsSingle(const ExtGnssFix &fx, bool fixOk)
 
   logSystem("MQTT: gps(single) published OK");
   return true;
+}
+
+bool mqttPublishVictronStateIfPending()
+{
+  if (!victronManagerPublishPending())
+  {
+    return true;
+  }
+
+  if (!mqttClient || !mqttClient->connected())
+  {
+    logSystem("MQTT: cannot publish Victron state, not connected");
+    return false;
+  }
+
+  String payload = victronManagerBuildStateJson();
+  bool ok = mqttClient->publish(MQTT_TOPIC_VICTRON_STATE, payload.c_str(), true);
+
+  logSystem(String("MQTT: Victron state publish ") + (ok ? "OK" : "FAILED") +
+            " topic=" + String(MQTT_TOPIC_VICTRON_STATE) +
+            " bytes=" + String(payload.length()));
+
+  if (ok)
+  {
+    victronManagerClearPublishPending();
+  }
+
+  return ok;
 }
 
 bool mqttPublishNetStatus()

@@ -78,6 +78,35 @@ static const char MQTT_TOPIC_PIR[] = "van/ellie/tele/pir";
 static const char MQTT_TOPIC_ACK[] = "van/ellie/ack";
 static const char MQTT_TOPIC_VERSION[] = "van/ellie/tele/version";
 
+
+// -------- Victron BLE telemetry -----------------------------
+// Första implementationen körs bara schemalagt i PARKED.
+// MQTT-topic behålls kompatibel med befintlig Home Assistant victron.yaml.
+#ifndef VICTRON_BLE_ENABLED
+#define VICTRON_BLE_ENABLED 1
+#endif
+
+// ============================================================
+// Victron BLE diagnostik
+// ------------------------------------------------------------
+// 0 = normal drift/test: bara kort scan-summary + lyckade dekoderader.
+// 1 = felsökning: logga begränsat antal råa okända/parse-fail-paket.
+// ============================================================
+#ifndef VICTRON_BLE_DIAG_VERBOSE
+#define VICTRON_BLE_DIAG_VERBOSE 0
+#endif
+
+#ifndef VICTRON_BLE_DIAG_MAX_UNKNOWN_PER_SCAN
+#define VICTRON_BLE_DIAG_MAX_UNKNOWN_PER_SCAN 3
+#endif
+
+#ifndef VICTRON_BLE_DIAG_MAX_PARSE_FAIL_PER_SCAN
+#define VICTRON_BLE_DIAG_MAX_PARSE_FAIL_PER_SCAN 3
+#endif
+
+static const char MQTT_TOPIC_VICTRON_STATE[] = "campervan/victron/state";
+constexpr uint32_t VICTRON_FRESH_TIMEOUT_MS = 20UL * 60UL * 1000UL;
+
 // -------- Network mode / robust uppkoppling -----------------
 // HA publicerar önskat nätläge här med retain=true.
 static const char MQTT_TOPIC_NET_MODE_DESIRED[] = "van/ellie/state/net_mode_desired";

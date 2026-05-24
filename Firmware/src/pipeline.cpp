@@ -7,6 +7,7 @@
 #include "mqtt.h"
 #include "profiles.h"
 #include "time_manager.h"
+#include "victron_manager.h"
 
 #include <WiFi.h>
 
@@ -119,6 +120,9 @@ enum class Step
     STEP_MQTT_DISCONNECT,
     STEP_RF_OFF,
     STEP_IDLE_WAIT,
+
+    // Kort, kontrollerad BLE-scan av Victron-enheter.
+    STEP_VICTRON_BLE_SCAN,
 
     // Nytt: kontrollerat återhämtningsläge.
     STEP_RECOVERY_WAIT
@@ -470,6 +474,8 @@ static const char *stepName(Step s)
         return "RF_OFF";
     case Step::STEP_IDLE_WAIT:
         return "IDLE_WAIT";
+    case Step::STEP_VICTRON_BLE_SCAN:
+        return "VICTRON_BLE_SCAN";
     case Step::STEP_RECOVERY_WAIT:
         return "RECOVERY_WAIT";
     default:
@@ -833,6 +839,12 @@ static void stepEnter(Step s, uint32_t nowMs)
         g_deadlineMs = g_nextCommAtMs;
         break;
 
+    case Step::STEP_VICTRON_BLE_SCAN:
+        g_bootProfileSyncActive = false;
+        // Scan körs blockande direkt i tick och går sedan tillbaka till DECIDE.
+        g_deadlineMs = nowMs + (currentProfile().victronBleScanSeconds * 1000UL) + 5000UL;
+        break;
+
     case Step::STEP_RECOVERY_WAIT:
         // requestRecovery() sätter deadline direkt.
         break;
@@ -1112,6 +1124,8 @@ void pipelineInit()
         modemRfOff();
     }
 
+    victronManagerInit();
+
     // PIR-ingångar
     pinMode(PIN_PIR_FRONT, INPUT_PULLDOWN);
     pinMode(PIN_PIR_BACK, INPUT_PULLDOWN);
@@ -1178,6 +1192,21 @@ void pipelineTick(uint32_t nowMs)
             else
             {
                 stepEnter(Step::STEP_NET_ATTACH, nowMs);
+            }
+            break;
+        }
+
+        // Victron BLE får lägst prioritet: aldrig före PIR/profil/ordinarie kommunikation.
+        // Första versionen är tänkt för PARKED med kommunikation avstängd.
+        if (victronManagerDue(nowMs, currentProfile()))
+        {
+            if (currentProfile().victronBleRequiresCommsOff && mqttIsConnected())
+            {
+                stepEnter(Step::STEP_MQTT_DISCONNECT, nowMs);
+            }
+            else
+            {
+                stepEnter(Step::STEP_VICTRON_BLE_SCAN, nowMs);
             }
             break;
         }
@@ -1412,6 +1441,14 @@ void pipelineTick(uint32_t nowMs)
             mqttHasPendingProfileAck(),
             g_pir.pending);
 
+        // Victron är extra telemetri. Misslyckad Victron-publish ska loggas,
+        // men inte dra igång recovery eller störa larmets kärnflöde.
+        bool victronOk = mqttPublishVictronStateIfPending();
+        if (!victronOk)
+        {
+            logSystem("MQTT: Victron publish failed/deferred");
+        }
+
         // Treata detta som lyckad publish-cykel om ALIVE gick igenom,
         // nätstatus gick igenom och eventuell profile-ACK också gick igenom.
         bool cycleHealthy = aliveOk && ackOk && netStatusOk && healthOk;
@@ -1569,7 +1606,7 @@ void pipelineTick(uint32_t nowMs)
         break;
 
     case Step::STEP_IDLE_WAIT:
-        if (g_pir.pending || timeReached(nowMs, g_nextCommAtMs))
+        if (g_pir.pending || timeReached(nowMs, g_nextCommAtMs) || victronManagerDue(nowMs, currentProfile()))
         {
             stepEnter(Step::STEP_DECIDE, nowMs);
             break;
@@ -1588,6 +1625,31 @@ void pipelineTick(uint32_t nowMs)
         }
 
         break;
+
+    case Step::STEP_VICTRON_BLE_SCAN:
+    {
+        // Extra skydd: om något kritiskt hann komma in innan scan startar, avbryt BLE.
+        if (g_pir.pending || timeReached(nowMs, g_nextCommAtMs))
+        {
+            logSystem("VICTRON: scan skipped, communication/PIR became due");
+            stepEnter(Step::STEP_DECIDE, nowMs);
+            break;
+        }
+
+        if (currentProfile().victronBleRequiresCommsOff)
+        {
+            mqttDisconnect();
+            wifiPowerOff();
+            modemAbortConnectData();
+            // Modemet är normalt redan RF_OFF efter föregående kommunikationsfönster.
+            // Kör inte CFUN=0 här igen; det kan blockera ~5 s och ge
+            // "CFUN=0 failed" precis före BLE-scan.
+        }
+
+        victronManagerRunScanOnce(nowMs, currentProfile().victronBleScanSeconds);
+        stepEnter(Step::STEP_DECIDE, millis());
+        break;
+    }
 
     case Step::STEP_RECOVERY_WAIT:
         performRecovery(nowMs);
